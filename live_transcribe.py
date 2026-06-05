@@ -10,9 +10,12 @@ No SSH in the hot path.
 """
 import argparse
 import io
+import subprocess
 import sys
+import time
 import urllib.request
 import wave
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -24,8 +27,10 @@ SAMPLE_RATE = 16000
 CHUNK_SECONDS = 8
 MIN_CHUNK_SECONDS = 2
 BLOCK_SIZE = int(SAMPLE_RATE * 0.1)  # 100ms blocks
-SLIDE_CHANGE_THRESHOLD = 8.0  # mean pixel diff (0-255) to count as a new slide
+SCREENSHOT_DIR = Path.home() / "Pictures" / "Screenshots"
+SLIDE_CHANGE_THRESHOLD = 8.0
 THUMB_SIZE = (64, 64)
+LAST_SENT_PATH = Path("/tmp/_sbi_last_sent.jpg")
 
 _last_thumb = None
 
@@ -48,25 +53,43 @@ def _rms(audio: np.ndarray) -> float:
 def capture_and_push_screenshot():
     global _last_thumb
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-f", "x11grab", "-video_size", "1920x1080",
-             "-i", ":0.0", "-frames:v", "1", "-f", "image2", "-update", "1",
-             "/tmp/_sbi_screenshot.png", "-y"],
-            capture_output=True, timeout=5
-        )
-        if result.returncode != 0:
+        # note existing files so we can spot the new one
+        before = set(SCREENSHOT_DIR.glob("*.png"))
+
+        subprocess.run(["ydotool", "key", "shift+print"], capture_output=True, timeout=3)
+
+        # wait up to 2s for new file
+        new_file = None
+        for _ in range(20):
+            time.sleep(0.1)
+            after = set(SCREENSHOT_DIR.glob("*.png"))
+            new_files = after - before
+            if new_files:
+                new_file = max(new_files, key=lambda f: f.stat().st_mtime)
+                break
+
+        if not new_file:
             return
-        img = Image.open("/tmp/_sbi_screenshot.png")
+
+        img = Image.open(new_file)
         thumb = np.array(img.resize(THUMB_SIZE, Image.LANCZOS).convert("L"), dtype=float)
         if _last_thumb is not None:
             diff = np.mean(np.abs(thumb - _last_thumb))
             if diff < SLIDE_CHANGE_THRESHOLD:
+                new_file.unlink(missing_ok=True)
                 return
+
         _last_thumb = thumb
+
         # encode as JPEG and POST
         buf = io.BytesIO()
         img.resize((1280, int(img.height * 1280 / img.width)), Image.LANCZOS).save(buf, format="JPEG", quality=75)
         jpeg = buf.getvalue()
+
+        # keep a copy of last sent for reference
+        LAST_SENT_PATH.write_bytes(jpeg)
+        new_file.unlink(missing_ok=True)
+
         req = urllib.request.Request(
             f"{SERVER}/image",
             data=jpeg,
@@ -74,6 +97,7 @@ def capture_and_push_screenshot():
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10)
+        print("  [slide captured]")
     except Exception as e:
         print(f"\n[screenshot warn] {e}", file=sys.stderr)
 
