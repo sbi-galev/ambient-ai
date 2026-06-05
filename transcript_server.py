@@ -54,12 +54,19 @@ HTML = """<!DOCTYPE html>
     #status { position: fixed; top: 10px; right: 15px; font-size: 0.7em;
               color: #444; letter-spacing: 1px; }
     #status.live { color: #4a4; }
+    #save-btn { position: fixed; bottom: 20px; right: 20px;
+                background: #1a1a1a; color: #888; border: 1px solid #333;
+                padding: 8px 16px; border-radius: 4px; cursor: pointer;
+                font-size: 0.8em; letter-spacing: 1px; }
+    #save-btn:hover { color: #fff; border-color: #555; }
+    #save-btn.saved { color: #4a4; border-color: #4a4; }
   </style>
 </head>
 <body>
   <h2>SBI4GALEV — Live Transcript</h2>
   <div id="transcript"></div>
   <div id="status">connecting…</div>
+  <button id="save-btn" onclick="saveTranscript()">Save transcript</button>
   <script>
     const t = document.getElementById('transcript');
     const s = document.getElementById('status');
@@ -79,6 +86,14 @@ HTML = """<!DOCTYPE html>
       appendItem({type:'image', data: e.data}, true);
       window.scrollTo(0, document.body.scrollHeight);
     });
+    function saveTranscript() {
+      const btn = document.getElementById('save-btn');
+      fetch('/save', {method:'POST', headers:{'X-Token':'sbi4galev'}})
+        .then(r => r.json())
+        .then(d => { btn.textContent = 'Saved ✓'; btn.className = 'saved';
+                     setTimeout(() => { btn.textContent = 'Save transcript'; btn.className = ''; }, 3000); })
+        .catch(() => { btn.textContent = 'Error'; setTimeout(() => { btn.textContent = 'Save transcript'; }, 2000); });
+    }
     function appendItem(item, isNew) {
       if (item.type === 'image') {
         const img = document.createElement('img');
