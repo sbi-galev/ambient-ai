@@ -4,7 +4,8 @@ Loads stt_en_fastconformer_transducer_xxlarge once on startup, then serves:
   POST /transcribe  — audio file → NeMo inference → pushes text to SSE
   POST /image       — JPEG screenshot → pushes to SSE if slide changed
   POST /push        — raw text → pushes to SSE (fallback/testing)
-  POST /clear       — clears transcript and images
+  POST /save        — saves current transcript to a timestamped file
+  POST /clear       — saves transcript then clears it
   GET  /stream      — SSE stream for browsers
   GET  /            — transcript viewer HTML
 """
@@ -16,7 +17,12 @@ import queue
 import subprocess
 import tempfile
 import threading
+from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+SAVE_DIR = Path(__file__).parent / "transcripts"
+SAVE_DIR.mkdir(exist_ok=True)
 
 PORT = int(os.environ.get("TRANSCRIPT_PORT", "7103"))
 TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "sbi4galev")
@@ -89,6 +95,16 @@ HTML = """<!DOCTYPE html>
   </script>
 </body>
 </html>"""
+
+
+def _save_transcript() -> Path:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = SAVE_DIR / f"{timestamp}.txt"
+    with _lock:
+        text = " ".join(item["data"] for item in _history if item["type"] == "text")
+    path.write_text(text.strip() + "\n")
+    print(f"Transcript saved: {path}", flush=True)
+    return path
 
 
 def _push(event_type, data):
@@ -201,7 +217,11 @@ class Handler(BaseHTTPRequestHandler):
                 _push("text", text)
             self.send_response(204)
             self.end_headers()
+        elif self.path == "/save":
+            path = _save_transcript()
+            self._json(200, {"saved": str(path)})
         elif self.path == "/clear":
+            _save_transcript()
             with _lock:
                 _history.clear()
                 for q in _subscribers:
