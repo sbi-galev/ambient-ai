@@ -39,73 +39,288 @@ HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Live Transcript</title>
   <style>
-    body { font-family: sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px;
-           background: #0a0a0a; color: #e0e0e0; }
-    h2 { color: #aaa; font-weight: 300; letter-spacing: 2px; text-transform: uppercase;
-         font-size: 0.8em; margin-bottom: 2em; }
-    #transcript { line-height: 1.8; font-size: 1.1em; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0a; color: #e0e0e0; font-family: sans-serif; overflow: hidden; }
+
+    #container {
+      height: 100vh;
+      overflow-y: scroll;
+      scroll-behavior: auto;
+    }
+    /* hide scrollbar */
+    #container::-webkit-scrollbar { display: none; }
+    #container { -ms-overflow-style: none; scrollbar-width: none; }
+
+    .section {
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 58% 42%;
+      opacity: 0.2;
+      transition: opacity 0.5s ease;
+      padding: 0;
+    }
+    .section.text-only {
+      grid-template-columns: 1fr;
+    }
+    .section.active { opacity: 1; }
+
+    .slide-pane {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 32px 48px 48px;
+      border-right: 1px solid #1a1a1a;
+    }
+    .slide-pane img {
+      width: 100%;
+      max-height: calc(100vh - 120px);
+      object-fit: contain;
+      border-radius: 6px;
+      border: 1px solid #222;
+    }
+    .slide-timestamp {
+      margin-top: 10px;
+      font-size: 0.65em;
+      color: #444;
+      letter-spacing: 1px;
+      align-self: flex-start;
+    }
+
+    .text-pane {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 48px 48px 48px 32px;
+      overflow: hidden;
+    }
+    .section.text-only .text-pane {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 80px 48px;
+      justify-content: flex-start;
+      padding-top: 15vh;
+    }
+    .label {
+      font-size: 0.65em;
+      color: #333;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 1.4em;
+    }
+    .text-pane p {
+      line-height: 1.85;
+      font-size: 1.05em;
+      color: #999;
+    }
     .chunk.new { color: #fff; }
-    .chunk.old { color: #888; }
-    .slide { display: block; max-width: 100%; margin: 1.2em 0 0.8em 0;
-             border-radius: 6px; border: 1px solid #222; }
-    #status { position: fixed; top: 10px; right: 15px; font-size: 0.7em;
-              color: #444; letter-spacing: 1px; }
+
+    #status {
+      position: fixed; top: 16px; right: 20px;
+      font-size: 0.65em; color: #333; letter-spacing: 1px; z-index: 100;
+    }
     #status.live { color: #4a4; }
-    #save-btn { position: fixed; bottom: 20px; right: 20px;
-                background: #1a1a1a; color: #888; border: 1px solid #333;
-                padding: 8px 16px; border-radius: 4px; cursor: pointer;
-                font-size: 0.8em; letter-spacing: 1px; }
-    #save-btn:hover { color: #fff; border-color: #555; }
+
+    #save-btn {
+      position: fixed; bottom: 20px; right: 20px; z-index: 100;
+      background: #111; color: #555; border: 1px solid #222;
+      padding: 8px 18px; border-radius: 4px; cursor: pointer;
+      font-size: 0.75em; letter-spacing: 1px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    #save-btn:hover { color: #fff; border-color: #444; }
     #save-btn.saved { color: #4a4; border-color: #4a4; }
+
+    #nav {
+      position: fixed; right: 20px; top: 50%; transform: translateY(-50%);
+      display: flex; flex-direction: column; gap: 6px; z-index: 100;
+    }
+    .nav-dot {
+      width: 5px; height: 5px; border-radius: 50%;
+      background: #333; cursor: pointer; transition: background 0.3s;
+    }
+    .nav-dot.active { background: #888; }
   </style>
 </head>
 <body>
-  <h2>SBI4GALEV — Live Transcript</h2>
-  <div id="transcript"></div>
+  <div id="container"></div>
   <div id="status">connecting…</div>
-  <button id="save-btn" onclick="saveTranscript()">Save transcript</button>
+  <button id="save-btn" onclick="saveTranscript()">Save</button>
+  <div id="nav"></div>
+
   <script>
-    const t = document.getElementById('transcript');
-    const s = document.getElementById('status');
+    const container = document.getElementById('container');
+    const statusEl = document.getElementById('status');
+    const navEl = document.getElementById('nav');
+
+    let sections = [];       // DOM .section elements
+    let currentIdx = 0;
+    let animating = false;
+    let atLatest = true;     // whether user is on the newest section
+
+    // ── Section management ──────────────────────────────────────────────
+
+    function getOrCreatePrologue() {
+      if (sections.length === 0) addSection(true);
+      if (sections[sections.length - 1].dataset.type === 'text-only') {
+        return sections[sections.length - 1];
+      }
+      return null;
+    }
+
+    function addSection(textOnly) {
+      const sec = document.createElement('div');
+      sec.className = 'section' + (textOnly ? ' text-only' : '');
+      sec.dataset.type = textOnly ? 'text-only' : 'slide';
+
+      if (!textOnly) {
+        const slidePane = document.createElement('div');
+        slidePane.className = 'slide-pane';
+        sec.appendChild(slidePane);
+      }
+
+      const textPane = document.createElement('div');
+      textPane.className = 'text-pane';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = textOnly ? 'SBI4GALEV — Live Transcript' : 'Transcript';
+      const p = document.createElement('p');
+      textPane.appendChild(label);
+      textPane.appendChild(p);
+      sec.appendChild(textPane);
+
+      container.appendChild(sec);
+      sections.push(sec);
+      observer.observe(sec);
+      updateNav();
+      return sec;
+    }
+
+    function currentTextP() {
+      const sec = sections[sections.length - 1];
+      return sec.querySelector('.text-pane p');
+    }
+
+    function appendText(text, isNew) {
+      if (sections.length === 0) addSection(true);
+      const p = currentTextP();
+      const span = document.createElement('span');
+      span.className = 'chunk' + (isNew ? ' new' : '');
+      span.textContent = text + ' ';
+      p.appendChild(span);
+      if (isNew && atLatest) snapTo(sections.length - 1);
+    }
+
+    function appendImage(b64, timestamp) {
+      // new section for this slide
+      const sec = addSection(false);
+      const slidePane = sec.querySelector('.slide-pane');
+      const img = document.createElement('img');
+      img.src = 'data:image/jpeg;base64,' + b64;
+      slidePane.appendChild(img);
+      const ts = document.createElement('div');
+      ts.className = 'slide-timestamp';
+      ts.textContent = timestamp;
+      slidePane.appendChild(ts);
+      if (atLatest) snapTo(sections.length - 1);
+    }
+
+    function appendItem(item, isNew) {
+      if (item.type === 'image') {
+        appendImage(item.data, item.ts || '');
+      } else {
+        // dim previous "new" spans
+        if (isNew) document.querySelectorAll('.chunk.new').forEach(el => el.classList.remove('new'));
+        appendText(item.data, isNew);
+      }
+    }
+
+    // ── SSE ─────────────────────────────────────────────────────────────
+
     const es = new EventSource('/stream');
-    es.onopen = () => { s.textContent = '● live'; s.className = 'live'; };
-    es.onerror = () => { s.textContent = 'reconnecting…'; s.className = ''; };
+    es.onopen = () => { statusEl.textContent = '● live'; statusEl.className = 'live'; };
+    es.onerror = () => { statusEl.textContent = 'reconnecting…'; statusEl.className = ''; };
     es.addEventListener('history', e => {
-      t.innerHTML = '';
+      container.innerHTML = ''; sections = []; navEl.innerHTML = '';
       JSON.parse(e.data).forEach(item => appendItem(item, false));
     });
-    es.addEventListener('chunk', e => {
-      document.querySelectorAll('.chunk.new').forEach(el => el.className = 'chunk old');
-      appendItem({type:'text', data: e.data}, true);
-      window.scrollTo(0, document.body.scrollHeight);
+    es.addEventListener('chunk', e => appendItem({type:'text', data: e.data}, true));
+    es.addEventListener('image', e => appendItem(JSON.parse(e.data), true));
+
+    // ── Intersection Observer (dim/undim) ────────────────────────────────
+
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        const idx = sections.indexOf(entry.target);
+        entry.target.classList.toggle('active', entry.isIntersecting);
+        if (entry.isIntersecting && idx !== -1) {
+          currentIdx = idx;
+          updateNav();
+          atLatest = (idx === sections.length - 1);
+        }
+      });
+    }, { root: container, threshold: 0.5 });
+
+    // ── Scroll with ease-out-cubic ───────────────────────────────────────
+
+    function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+    function snapTo(idx) {
+      if (idx < 0 || idx >= sections.length || animating) return;
+      currentIdx = idx;
+      animating = true;
+      const start = container.scrollTop;
+      const end = sections[idx].offsetTop;
+      const dist = end - start;
+      const dur = 650;
+      let t0 = null;
+      function step(ts) {
+        if (!t0) t0 = ts;
+        const p = Math.min((ts - t0) / dur, 1);
+        container.scrollTop = start + dist * easeOutCubic(p);
+        if (p < 1) requestAnimationFrame(step);
+        else { animating = false; updateNav(); }
+      }
+      requestAnimationFrame(step);
+    }
+
+    container.addEventListener('wheel', e => {
+      e.preventDefault();
+      if (animating) return;
+      if (e.deltaY > 20) snapTo(Math.min(currentIdx + 1, sections.length - 1));
+      else if (e.deltaY < -20) snapTo(Math.max(currentIdx - 1, 0));
+    }, { passive: false });
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'PageDown') { e.preventDefault(); snapTo(currentIdx + 1); }
+      if (e.key === 'ArrowUp'   || e.key === 'PageUp')   { e.preventDefault(); snapTo(currentIdx - 1); }
     });
-    es.addEventListener('image', e => {
-      appendItem({type:'image', data: e.data}, true);
-      window.scrollTo(0, document.body.scrollHeight);
-    });
+
+    // ── Nav dots ─────────────────────────────────────────────────────────
+
+    function updateNav() {
+      navEl.innerHTML = '';
+      sections.forEach((_, i) => {
+        const dot = document.createElement('div');
+        dot.className = 'nav-dot' + (i === currentIdx ? ' active' : '');
+        dot.onclick = () => snapTo(i);
+        navEl.appendChild(dot);
+      });
+    }
+
+    // ── Save ─────────────────────────────────────────────────────────────
+
     function saveTranscript() {
       const btn = document.getElementById('save-btn');
       fetch('/save', {method:'POST', headers:{'X-Token':'sbi4galev'}})
         .then(r => r.json())
-        .then(d => { btn.textContent = 'Saved ✓'; btn.className = 'saved';
-                     setTimeout(() => { btn.textContent = 'Save transcript'; btn.className = ''; }, 3000); })
-        .catch(() => { btn.textContent = 'Error'; setTimeout(() => { btn.textContent = 'Save transcript'; }, 2000); });
-    }
-    function appendItem(item, isNew) {
-      if (item.type === 'image') {
-        const img = document.createElement('img');
-        img.src = 'data:image/jpeg;base64,' + item.data;
-        img.className = 'slide';
-        t.appendChild(img);
-      } else {
-        const span = document.createElement('span');
-        span.className = 'chunk ' + (isNew ? 'new' : 'old');
-        span.textContent = item.data + ' ';
-        t.appendChild(span);
-      }
+        .then(() => { btn.textContent = 'Saved ✓'; btn.className = 'saved';
+                      setTimeout(() => { btn.textContent = 'Save'; btn.className = ''; }, 3000); })
+        .catch(() => { btn.textContent = 'Error';
+                       setTimeout(() => { btn.textContent = 'Save'; }, 2000); });
     }
   </script>
 </body>
@@ -197,8 +412,10 @@ class Handler(BaseHTTPRequestHandler):
                     item = q.get()
                     if item is None:
                         break
-                    event = item["type"] if item["type"] == "image" else "chunk"
-                    self.wfile.write(f"event: {event}\ndata: {item['data']}\n\n".encode())
+                    if item["type"] == "image":
+                        self.wfile.write(f"event: image\ndata: {json.dumps(item)}\n\n".encode())
+                    else:
+                        self.wfile.write(f"event: chunk\ndata: {item['data']}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -223,7 +440,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/image":
             raw = self._read_body()
             b64 = base64.b64encode(raw).decode()
-            _push("image", b64)
+            ts = datetime.now().strftime("%H:%M:%S")
+            item = {"type": "image", "data": b64, "ts": ts}
+            with _lock:
+                _history.append(item)
+                for q in _subscribers:
+                    q.put(item)
             self.send_response(204)
             self.end_headers()
         elif self.path == "/push":
