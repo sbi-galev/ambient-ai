@@ -9,6 +9,20 @@ Loads stt_en_fastconformer_transducer_xxlarge once on startup, then serves:
   GET  /stream      — SSE stream for browsers
   GET  /            — transcript viewer HTML
 """
+import sys
+import types
+
+# torchaudio CUDA version check fails if torchaudio/PyTorch were built against
+# different CUDA versions (e.g. after a PyTorch update). Stub the extension
+# module to bypass the check — NeMo only needs torchaudio for transforms, not
+# the C++ extension.
+_fake_ext = types.ModuleType('torchaudio._extension')
+_fake_ext._check_cuda_version = lambda: None
+_fake_ext._IS_TORCHAUDIO_EXT_AVAILABLE = False
+_fake_ext._IS_ALIGN_AVAILABLE = False
+_fake_ext.fail_if_no_align = lambda f: f
+sys.modules['torchaudio._extension'] = _fake_ext
+
 import base64
 import io
 import json

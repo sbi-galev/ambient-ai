@@ -10,9 +10,7 @@ No SSH in the hot path.
 """
 import argparse
 import io
-import subprocess
 import sys
-import time
 import urllib.request
 import wave
 from pathlib import Path
@@ -21,18 +19,23 @@ import numpy as np
 import sounddevice as sd
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).parent / "sbi4galev"))
+from screen_capture import ScreenCapture
+
 SERVER = "http://172.24.17.90:7103"
 TOKEN = "sbi4galev"
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 8
 MIN_CHUNK_SECONDS = 2
 BLOCK_SIZE = int(SAMPLE_RATE * 0.1)  # 100ms blocks
-SCREENSHOT_DIR = Path.home() / "Pictures" / "Screenshots"
+SAVE_DIR = Path.home() / "Pictures" / "SBI4GALEV"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+LAST_SENT_PATH = SAVE_DIR / "last_sent.jpg"
 SLIDE_CHANGE_THRESHOLD = 8.0
 THUMB_SIZE = (64, 64)
-LAST_SENT_PATH = Path("/tmp/_sbi_last_sent.jpg")
 
 _last_thumb = None
+_screen = None
 
 
 def _pcm_to_wav(pcm: np.ndarray) -> bytes:
@@ -51,44 +54,27 @@ def _rms(audio: np.ndarray) -> float:
 
 
 def capture_and_push_screenshot():
-    global _last_thumb
+    global _last_thumb, _screen
     try:
-        # note existing files so we can spot the new one
-        before = set(SCREENSHOT_DIR.glob("*.png"))
-
-        subprocess.run(["ydotool", "key", "shift+print"], capture_output=True, timeout=3)
-
-        # wait up to 2s for new file
-        new_file = None
-        for _ in range(20):
-            time.sleep(0.1)
-            after = set(SCREENSHOT_DIR.glob("*.png"))
-            new_files = after - before
-            if new_files:
-                new_file = max(new_files, key=lambda f: f.stat().st_mtime)
-                break
-
-        if not new_file:
+        if _screen is None:
+            return
+        img = _screen.grab()
+        if img is None:
             return
 
-        img = Image.open(new_file)
         thumb = np.array(img.resize(THUMB_SIZE, Image.LANCZOS).convert("L"), dtype=float)
         if _last_thumb is not None:
             diff = np.mean(np.abs(thumb - _last_thumb))
             if diff < SLIDE_CHANGE_THRESHOLD:
-                new_file.unlink(missing_ok=True)
                 return
 
         _last_thumb = thumb
 
-        # encode as JPEG and POST
         buf = io.BytesIO()
         img.resize((1280, int(img.height * 1280 / img.width)), Image.LANCZOS).save(buf, format="JPEG", quality=75)
         jpeg = buf.getvalue()
 
-        # keep a copy of last sent for reference
         LAST_SENT_PATH.write_bytes(jpeg)
-        new_file.unlink(missing_ok=True)
 
         req = urllib.request.Request(
             f"{SERVER}/image",
@@ -122,10 +108,16 @@ def transcribe_and_push(pcm: np.ndarray):
 
 
 def run(device: int, silence_threshold: float):
+    global _screen
     buffer = []
     silence_frames = 0
     frames_per_chunk = int(SAMPLE_RATE * CHUNK_SECONDS)
     min_frames = int(SAMPLE_RATE * MIN_CHUNK_SECONDS)
+
+    try:
+        _screen = ScreenCapture()
+    except Exception as e:
+        print(f"[warn] Screen capture unavailable: {e}", file=sys.stderr)
 
     print(f"Recording on device {device} — speak now. Ctrl+C to stop.\n")
 
@@ -153,6 +145,8 @@ def run(device: int, silence_threshold: float):
     except KeyboardInterrupt:
         if buffer and sum(len(b) for b in buffer) >= min_frames:
             transcribe_and_push(np.concatenate(buffer))
+        if _screen:
+            _screen.stop()
         print("\nDone.")
 
 

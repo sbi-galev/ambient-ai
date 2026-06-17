@@ -1,0 +1,4 @@
+# Laptop-side dependencies (pip install -r requirements.txt)
+sounddevice
+numpy
+Pillow
