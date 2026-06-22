@@ -111,8 +111,15 @@ def transcribe_and_push(pcm: np.ndarray):
         print(f"\n[warn] {e}", file=sys.stderr)
 
 
-def _find_default_sink() -> str:
-    """Return the PipeWire node name of the default audio output sink."""
+def _find_default_sink(preferred: str = None) -> str:
+    """Return the sink whose monitor to capture.
+
+    The explicit ``preferred`` (--sink) wins; otherwise the system default
+    sink, which Zoom repoints to its share sink (``zoomcombine``) while
+    sharing computer sound — exactly the audio we want.
+    """
+    if preferred:
+        return preferred
     try:
         out = subprocess.run(
             ["pw-metadata", "0", "default.audio.sink"],
@@ -137,15 +144,20 @@ def _find_default_sink() -> str:
     return None
 
 
-def _zoom_blocks():
-    """Generator: yield float32 mono numpy blocks from pw-record on the default sink monitor."""
-    sink = _find_default_sink()
+def _zoom_blocks(sink: str = None):
+    """Generator: yield float32 mono numpy blocks from pw-record on a sink monitor."""
+    sink = _find_default_sink(sink)
     if sink is None:
-        print("[zoom] Could not find default audio sink", file=sys.stderr)
+        print("[zoom] Could not find an audio output sink", file=sys.stderr)
         return
 
-    print(f"  [zoom] capturing monitor of: {sink}")
-    cmd = ["pw-record", f"--target={sink}", "--format=s16",
+    # stream.capture.sink=true makes the capture stream pull the sink's MONITOR.
+    # Without it, pw-record binds to a source and silently falls back to the
+    # default source (the microphone) — proven via the link graph.
+    target = sink.removesuffix(".monitor")
+    print(f"  [zoom] capturing monitor of sink: {target}")
+    cmd = ["pw-record", "-P", "stream.capture.sink=true",
+           f"--target={target}", "--format=s16",
            f"--rate={SAMPLE_RATE}", "--channels=2", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -171,7 +183,7 @@ def _zoom_blocks():
         proc.wait()
 
 
-def run(device, silence_threshold: float, zoom: bool = False):
+def run(device, silence_threshold: float, zoom: bool = False, sink: str = None):
     global _screen
     buffer = []
     silence_frames = 0
@@ -209,7 +221,7 @@ def run(device, silence_threshold: float, zoom: bool = False):
 
     try:
         if zoom:
-            _process_blocks(_zoom_blocks())
+            _process_blocks(_zoom_blocks(sink))
         else:
             with sd.InputStream(device=device, channels=1, samplerate=SAMPLE_RATE,
                                 dtype="float32", blocksize=BLOCK_SIZE) as stream:
@@ -233,6 +245,9 @@ if __name__ == "__main__":
     parser.add_argument("--silence", type=float, default=None)
     parser.add_argument("--zoom", action="store_true",
                         help="Capture Zoom output via PipeWire (ignores --device)")
+    parser.add_argument("--sink", default=None,
+                        help="Sink node name to capture the monitor of "
+                             "(overrides auto-detect; use with --zoom)")
     args = parser.parse_args()
     silence = args.silence if args.silence is not None else (0.01 if args.zoom else 0.05)
-    run(args.device, silence, zoom=args.zoom)
+    run(args.device, silence, zoom=args.zoom, sink=args.sink)
