@@ -4,10 +4,23 @@ Loads stt_en_fastconformer_transducer_xxlarge once on startup, then serves:
   POST /transcribe  — audio file → NeMo inference → pushes text to SSE
   POST /image       — JPEG screenshot → pushes to SSE if slide changed
   POST /push        — raw text → pushes to SSE (fallback/testing)
-  POST /save        — saves current transcript to a timestamped file
-  POST /clear       — saves transcript then clears it
+  POST /vote        — public: record a thumbs up/down on a speaker question
+  POST /save        — bundles the current talk (transcript + slides) into a
+                      dedicated, read-only folder, then resets for the next
+                      speaker. Token-protected; not exposed on the public page.
   GET  /stream      — SSE stream for browsers
-  GET  /            — transcript viewer HTML
+  GET  /            — public, view-only transcript viewer
+  GET  /admin?token=… — operator viewer with the End-talk/Save control
+  GET  /summaries   — AI summary of every saved talk (alan / local gemma)
+  GET  /talks/…     — read-only static access to saved slides/summaries; the
+                      full transcript files require the admin token (?token=…)
+
+After a talk is saved, a background worker sends its transcript + slides to the
+local model (alan's engine: gemma-4-31b via SGLang) and writes summary.json /
+summary.md into the talk folder, then finalises the folder read-only.
+
+There is deliberately no endpoint that deletes or mutates saved talks: once a
+talk is finalised its folder is made read-only and cannot be removed via HTTP.
 """
 import sys
 import types
@@ -24,19 +37,27 @@ _fake_ext.fail_if_no_align = lambda f: f
 sys.modules['torchaudio._extension'] = _fake_ext
 
 import base64
+import html
 import io
 import json
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
+import urllib.request
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SAVE_DIR = Path(__file__).parent / "transcripts"
 SAVE_DIR.mkdir(exist_ok=True)
+# Talk folders are read-only once finalised, so audience votes on speaker
+# questions live in a separate writable store, one JSON per talk.
+VOTES_DIR = Path(__file__).parent / "votes"
+VOTES_DIR.mkdir(exist_ok=True)
 
 PORT = int(os.environ.get("TRANSCRIPT_PORT", "7103"))
 TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "sbi4galev")
@@ -44,12 +65,27 @@ DEVICE = os.environ.get("STT_DEVICE", "cuda:0")
 MODEL_NAME = "stt_en_fastconformer_transducer_xxlarge"
 SAMPLE_RATE = 16000
 
+# Local summarisation model — alan's engine: SGLang serving gemma-4-31b-it on an
+# OpenAI-compatible endpoint. Override via env to repoint at another provider.
+LLM_URL = os.environ.get("ALAN_LLM_URL", "http://127.0.0.1:30000/v1/chat/completions")
+LLM_MODEL = os.environ.get("ALAN_LLM_MODEL", "google/gemma-4-31b-it")
+SUMMARIES_ENABLED = os.environ.get("SUMMARIES", "1") != "0"
+SUMMARY_MAX_SLIDES = int(os.environ.get("SUMMARY_MAX_SLIDES", "8"))
+
 _subscribers = []
 _lock = threading.Lock()
 _infer_lock = threading.Lock()
-_history = []  # list of {"type": "text"|"image", "data": str}
+_save_lock = threading.Lock()
+_summary_lock = threading.Lock()
+_votes_lock = threading.Lock()
+_history = []  # list of {"type": "text"|"image", "data": str, "ts": str}
 
-HTML = """<!DOCTYPE html>
+# ── Page template ───────────────────────────────────────────────────────────
+# Shared between the public viewer (/) and the operator viewer (/admin). The
+# admin-only Save controls are injected via the /*ADMIN_*/ placeholders so the
+# public page never carries the auth token or a way to end a talk.
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -138,16 +174,6 @@ HTML = """<!DOCTYPE html>
     }
     #status.live { color: #4a4; }
 
-    #save-btn {
-      position: fixed; bottom: 20px; right: 20px; z-index: 100;
-      background: #111; color: #555; border: 1px solid #222;
-      padding: 8px 18px; border-radius: 4px; cursor: pointer;
-      font-size: 0.75em; letter-spacing: 1px;
-      transition: color 0.2s, border-color 0.2s;
-    }
-    #save-btn:hover { color: #fff; border-color: #444; }
-    #save-btn.saved { color: #4a4; border-color: #4a4; }
-
     #nav {
       position: fixed; right: 20px; top: 50%; transform: translateY(-50%);
       display: flex; flex-direction: column; gap: 6px; z-index: 100;
@@ -157,12 +183,20 @@ HTML = """<!DOCTYPE html>
       background: #333; cursor: pointer; transition: background 0.3s;
     }
     .nav-dot.active { background: #888; }
+
+    #archive-link {
+      position: fixed; top: 16px; left: 20px; z-index: 100;
+      font-size: 0.65em; color: #444; letter-spacing: 1px; text-decoration: none;
+    }
+    #archive-link:hover { color: #aaa; }
+    /*ADMIN_CSS*/
   </style>
 </head>
 <body>
   <div id="container"></div>
   <div id="status">connecting…</div>
-  <button id="save-btn" onclick="saveTranscript()">Save</button>
+  <a id="archive-link" href="/summaries">▤ summaries</a>
+  <!--ADMIN_HTML-->
   <div id="nav"></div>
 
   <script>
@@ -252,17 +286,23 @@ HTML = """<!DOCTYPE html>
       }
     }
 
+    function resetView() {
+      container.innerHTML = ''; sections = []; navEl.innerHTML = '';
+      currentIdx = 0; atLatest = true;
+    }
+
     // ── SSE ─────────────────────────────────────────────────────────────
 
     const es = new EventSource('/stream');
     es.onopen = () => { statusEl.textContent = '● live'; statusEl.className = 'live'; };
     es.onerror = () => { statusEl.textContent = 'reconnecting…'; statusEl.className = ''; };
     es.addEventListener('history', e => {
-      container.innerHTML = ''; sections = []; navEl.innerHTML = '';
+      resetView();
       JSON.parse(e.data).forEach(item => appendItem(item, false));
     });
     es.addEventListener('chunk', e => appendItem({type:'text', data: e.data}, true));
     es.addEventListener('image', e => appendItem(JSON.parse(e.data), true));
+    es.addEventListener('reset', () => resetView());
 
     // ── Intersection Observer (dim/undim) ────────────────────────────────
 
@@ -325,34 +365,674 @@ HTML = """<!DOCTYPE html>
       });
     }
 
-    // ── Save ─────────────────────────────────────────────────────────────
-
-    function saveTranscript() {
-      const btn = document.getElementById('save-btn');
-      fetch('/save', {method:'POST', headers:{'X-Token':'sbi4galev'}})
-        .then(r => r.json())
-        .then(() => { btn.textContent = 'Saved ✓'; btn.className = 'saved';
-                      setTimeout(() => { btn.textContent = 'Save'; btn.className = ''; }, 3000); })
-        .catch(() => { btn.textContent = 'Error';
-                       setTimeout(() => { btn.textContent = 'Save'; }, 2000); });
-    }
+    /*ADMIN_JS*/
   </script>
 </body>
 </html>"""
 
+ADMIN_CSS = """
+    #save-bar {
+      position: fixed; bottom: 20px; right: 20px; z-index: 100;
+      display: flex; gap: 8px; align-items: center;
+    }
+    #talk-label {
+      background: #111; color: #ccc; border: 1px solid #222; border-radius: 4px;
+      padding: 8px 10px; font-size: 0.75em; width: 220px;
+    }
+    #talk-label:focus { outline: none; border-color: #444; }
+    #save-btn {
+      background: #111; color: #777; border: 1px solid #222;
+      padding: 8px 18px; border-radius: 4px; cursor: pointer;
+      font-size: 0.75em; letter-spacing: 1px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    #save-btn:hover { color: #fff; border-color: #444; }
+    #save-btn.saved { color: #4a4; border-color: #4a4; }
+    #save-btn.busy { opacity: 0.6; pointer-events: none; }"""
 
-def _save_transcript() -> Path:
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = SAVE_DIR / f"{timestamp}.txt"
-    with _lock:
-        text = " ".join(item["data"] for item in _history if item["type"] == "text")
-    path.write_text(text.strip() + "\n")
-    print(f"Transcript saved: {path}", flush=True)
-    return path
+ADMIN_HTML = """<div id="save-bar">
+    <input id="talk-label" placeholder="speaker / talk title (optional)" autocomplete="off">
+    <button id="save-btn" onclick="saveTalk()">End talk &amp; Save</button>
+  </div>"""
+
+ADMIN_JS = """
+    const TOKEN = __TOKEN__;
+    function saveTalk() {
+      const btn = document.getElementById('save-btn');
+      const labelEl = document.getElementById('talk-label');
+      const label = labelEl ? labelEl.value.trim() : '';
+      if (!confirm('End this talk and save? This starts a new recording for the next speaker.')) return;
+      btn.classList.add('busy'); btn.textContent = 'Saving…';
+      fetch('/save', {method:'POST', headers:{'X-Token': TOKEN, 'Content-Type':'application/json'},
+                      body: JSON.stringify({label})})
+        .then(r => r.json())
+        .then(res => {
+          btn.classList.remove('busy');
+          if (res && res.saved) {
+            btn.textContent = 'Saved ✓ ' + res.saved; btn.className = 'saved';
+            if (labelEl) labelEl.value = '';
+          } else {
+            btn.textContent = (res && res.reason) ? 'Nothing to save' : 'Saved ✓';
+          }
+          setTimeout(() => { btn.textContent = 'End talk & Save'; btn.className = ''; }, 4000);
+        })
+        .catch(() => { btn.classList.remove('busy'); btn.textContent = 'Error';
+                       setTimeout(() => { btn.textContent = 'End talk & Save'; }, 2500); });
+    }"""
+
+
+def render_page(admin: bool) -> str:
+    if admin:
+        return (PAGE_TEMPLATE
+                .replace("/*ADMIN_CSS*/", ADMIN_CSS)
+                .replace("<!--ADMIN_HTML-->", ADMIN_HTML)
+                .replace("/*ADMIN_JS*/", ADMIN_JS.replace("__TOKEN__", json.dumps(TOKEN))))
+    return (PAGE_TEMPLATE
+            .replace("/*ADMIN_CSS*/", "")
+            .replace("<!--ADMIN_HTML-->", "")
+            .replace("/*ADMIN_JS*/", ""))
+
+
+# ── Saving a talk ────────────────────────────────────────────────────────────
+
+def _slugify(label: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (label or "").strip().lower()).strip("-")
+    return s[:40]
+
+
+def _unique_dir(base: Path, name: str) -> Path:
+    cand = base / name
+    i = 2
+    while cand.exists():
+        cand = base / f"{name}-{i}"
+        i += 1
+    return cand
+
+
+def _make_readonly(top: Path):
+    """Drop write permission on a saved talk so it can't be modified or removed
+    in place (a 0o555 directory refuses unlink/create of its entries)."""
+    for root, dirs, files in os.walk(top):
+        for f in files:
+            try:
+                os.chmod(os.path.join(root, f), 0o444)
+            except OSError:
+                pass
+    for root, dirs, files in os.walk(top, topdown=False):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o555)
+            except OSError:
+                pass
+    try:
+        os.chmod(top, 0o555)
+    except OSError:
+        pass
+
+
+def _render_archive_html(label: str, meta: dict, session: list) -> str:
+    title = html.escape(label or meta.get("saved_at", "Transcript"))
+    rows = []
+    for item in session:
+        if item["type"] == "slide":
+            cap = html.escape(item.get("ts", ""))
+            rows.append(
+                f'<figure><img src="{item["file"]}" loading="lazy">'
+                f'<figcaption>{cap}</figcaption></figure>')
+        else:
+            rows.append(f'<p>{html.escape(item["text"])}</p>')
+    body = "\n".join(rows)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{title} — Transcript</title>
+  <style>
+    body {{ background:#0a0a0a; color:#ddd; font-family:sans-serif;
+           max-width:820px; margin:0 auto; padding:48px 24px 96px; line-height:1.8; }}
+    h1 {{ font-size:1.4em; font-weight:600; margin-bottom:0.2em; }}
+    .meta {{ color:#555; font-size:0.8em; letter-spacing:1px; margin-bottom:2.5em; }}
+    p {{ color:#bbb; margin:0.2em 0; }}
+    figure {{ margin:2em 0; }}
+    figure img {{ width:100%; border:1px solid #222; border-radius:6px; }}
+    figcaption {{ color:#555; font-size:0.7em; letter-spacing:1px; margin-top:6px; }}
+  </style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class="meta">Saved {html.escape(meta.get("saved_at", ""))} · {meta.get("n_slides", 0)} slides · {meta.get("n_text_chunks", 0)} text chunks</div>
+  {body}
+</body>
+</html>
+"""
+
+
+def _save_session(label: str):
+    """Bundle the current talk into a dedicated read-only folder, then reset the
+    live history for the next speaker. Returns a result dict, or None if there
+    was nothing recorded (in which case nothing is written and nothing reset)."""
+    with _save_lock:
+        with _lock:
+            snapshot = list(_history)
+
+        texts = [it for it in snapshot if it["type"] == "text"]
+        images = [it for it in snapshot if it["type"] == "image"]
+        if not texts and not images:
+            return None
+
+        ts_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        slug = _slugify(label)
+        folder = f"{ts_name}_{slug}" if slug else ts_name
+        talk_dir = _unique_dir(SAVE_DIR, folder)
+        slides_dir = talk_dir / "slides"
+        slides_dir.mkdir(parents=True)
+
+        # Slides → slides/slide_NNN.jpg, building the ordered session as we go.
+        session = []
+        n_slides = 0
+        for it in snapshot:
+            if it["type"] == "image":
+                n_slides += 1
+                fname = f"slide_{n_slides:03d}.jpg"
+                (slides_dir / fname).write_bytes(base64.b64decode(it["data"]))
+                session.append({"type": "slide", "ts": it.get("ts", ""),
+                                "file": f"slides/{fname}"})
+            else:
+                session.append({"type": "text", "ts": it.get("ts", ""),
+                                "text": it["data"]})
+
+        # Plain-text transcript.
+        text = " ".join(it["data"] for it in texts).strip() + "\n"
+        (talk_dir / "transcript.txt").write_text(text)
+
+        meta = {
+            "label": label or "",
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "n_slides": n_slides,
+            "n_text_chunks": len(texts),
+            "first_ts": snapshot[0].get("ts", ""),
+            "last_ts": snapshot[-1].get("ts", ""),
+        }
+        (talk_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        (talk_dir / "session.json").write_text(json.dumps(session, indent=2))
+        (talk_dir / "transcript.html").write_text(_render_archive_html(label, meta, session))
+
+        # Reset for the next speaker: drop exactly the saved prefix (anything
+        # that arrived mid-save is preserved) and tell every viewer to clear.
+        with _lock:
+            del _history[:len(snapshot)]
+            for q in _subscribers:
+                q.put({"type": "reset"})
+
+        # Summarise off the response thread (transcript + slides → alan/gemma),
+        # which finalises the folder read-only when done. If summaries are off,
+        # lock the folder now instead.
+        if SUMMARIES_ENABLED:
+            threading.Thread(target=_summary_worker, args=(talk_dir, label),
+                             daemon=True).start()
+        else:
+            _make_readonly(talk_dir)
+
+        print(f"Saved talk: {talk_dir.name} ({n_slides} slides, {len(texts)} text chunks)",
+              flush=True)
+        return {"saved": talk_dir.name, "path": str(talk_dir),
+                "n_slides": n_slides, "n_text_chunks": len(texts)}
+
+
+# ── Summarisation (alan / local gemma) ───────────────────────────────────────
+
+SUMMARY_SYSTEM = (
+    "You are alan, summarising a recorded conference talk for a public archive. "
+    "You are given the talk's transcript (from automatic speech recognition — expect "
+    "transcription errors and unreliable punctuation) and a sample of its slides, in order. "
+    "Write a faithful, concise summary that helps someone who missed the talk understand what "
+    "it covered and what was shown. Do not invent results or claims unsupported by the "
+    "transcript and slides. "
+    "Also propose exactly three questions an audience member might ask the speaker. "
+    "Make them direct, specific and substantive: real questions about the methods, design "
+    "choices, results, assumptions, limitations, comparisons or implications the talk actually "
+    "presented — the kind a well-prepared colleague would ask to understand or probe the work. "
+    "Keep them courteous and constructive rather than hostile, combative or dismissive, but do "
+    "not soften them with praise or pad them with warmth. Avoid vague, feel-good or motivational "
+    "questions — in particular do not ask what excited the speaker, what first drew them to the "
+    "topic, or simply what comes next. Ground every question in the talk's actual content. "
+    "Respond with ONLY a JSON object (no markdown, no code fences) with keys: "
+    '"title" (string), "speaker" (string, empty if unknown), "abstract" (1-3 sentences), '
+    '"key_points" (array of 3-7 short strings), "topics" (array of 2-6 keyword strings), '
+    '"questions" (array of exactly 3 kind, considerate question strings).')
+
+
+def _atomic_write_bytes(path: Path, data: bytes):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _llm_chat(messages, max_tokens=900, temperature=0.2, timeout=240) -> str:
+    payload = {"model": LLM_MODEL, "messages": messages,
+               "max_tokens": max_tokens, "temperature": temperature}
+    req = urllib.request.Request(
+        LLM_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.load(r)
+    return d["choices"][0]["message"]["content"]
+
+
+def _sample_slides(slides_dir: Path, limit: int):
+    """Return ([(filename, jpeg_b64), …], total_count), evenly sampled across the talk."""
+    files = sorted(slides_dir.glob("slide_*.jpg")) if slides_dir.is_dir() else []
+    total = len(files)
+    if total > limit > 1:
+        step = (total - 1) / (limit - 1)
+        idx = sorted({round(i * step) for i in range(limit)})
+        files = [files[i] for i in idx]
+    out = [(f.name, base64.b64encode(f.read_bytes()).decode()) for f in files]
+    return out, total
+
+
+def _parse_summary_json(raw: str, label: str) -> dict:
+    txt = raw.strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z]*\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt).strip()
+    d = None
+    candidates = [txt]
+    if "{" in txt and "}" in txt:
+        candidates.append(txt[txt.find("{"):txt.rfind("}") + 1])
+    for c in candidates:
+        try:
+            d = json.loads(c)
+            break
+        except Exception:
+            continue
+    if not isinstance(d, dict):
+        d = {"title": label or "Untitled talk", "abstract": raw.strip()[:600]}
+    return {
+        "title": (str(d.get("title") or "").strip() or label or "Untitled talk"),
+        "speaker": str(d.get("speaker") or "").strip(),
+        "abstract": str(d.get("abstract") or "").strip(),
+        "key_points": [str(x).strip() for x in (d.get("key_points") or []) if str(x).strip()][:10],
+        "topics": [str(x).strip() for x in (d.get("topics") or []) if str(x).strip()][:12],
+        "questions": [str(x).strip() for x in (d.get("questions") or []) if str(x).strip()][:3],
+    }
+
+
+def _summary_markdown(d: dict) -> str:
+    lines = [f"# {d['title']}", ""]
+    if d.get("speaker"):
+        lines += [f"**Speaker:** {d['speaker']}", ""]
+    if d.get("abstract"):
+        lines += [d["abstract"], ""]
+    if d.get("key_points"):
+        lines += ["## Key points", ""] + [f"- {p}" for p in d["key_points"]] + [""]
+    if d.get("topics"):
+        lines += ["**Topics:** " + ", ".join(d["topics"]), ""]
+    lines += [f"_Summary by {d.get('model', '')} · {d.get('generated_at', '')}._", ""]
+    return "\n".join(lines)
+
+
+def _generate_summary(talk_dir: Path, label: str) -> dict:
+    tf = talk_dir / "transcript.txt"
+    transcript = tf.read_text().strip() if tf.exists() else ""
+    slides, total = _sample_slides(talk_dir / "slides", SUMMARY_MAX_SLIDES)
+
+    header = f"Operator label for this talk: {label}\n\n" if label else ""
+    header += (f"Slides: {total} total, {len(slides)} sampled below in order.\n\n"
+               if total else "No slides were captured.\n\n")
+    user = [{"type": "text",
+             "text": f"{header}=== TRANSCRIPT ===\n{transcript[:200000] or '(empty)'}\n"
+                     f"=== END TRANSCRIPT ==="}]
+    for name, b64 in slides:
+        user.append({"type": "text", "text": f"Slide {name}:"})
+        user.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}})
+
+    raw = _llm_chat([{"role": "system", "content": SUMMARY_SYSTEM},
+                     {"role": "user", "content": user}])
+    data = _parse_summary_json(raw, label)
+    data["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    data["model"] = LLM_MODEL
+    data["n_slides"] = total
+    return data
+
+
+def _write_summary_outputs(talk_dir: Path, data: dict):
+    """Write summary.json, summary.md and questions.json from a generated dict.
+    Shared by the live worker and the backfill script."""
+    questions = data.pop("questions", [])
+    _atomic_write_bytes(talk_dir / "summary.json", json.dumps(data, indent=2).encode())
+    (talk_dir / "summary.md").write_text(_summary_markdown(data))
+    qobj = {"questions": [{"id": f"q{i + 1}", "text": t} for i, t in enumerate(questions[:3])],
+            "generated_at": data.get("generated_at", ""), "model": data.get("model", "")}
+    _atomic_write_bytes(talk_dir / "questions.json", json.dumps(qobj, indent=2).encode())
+
+
+def _summary_worker(talk_dir: Path, label: str):
+    """Background: generate a summary + questions, write them, then lock the folder."""
+    with _summary_lock:
+        try:
+            data = _generate_summary(talk_dir, label)
+            _write_summary_outputs(talk_dir, data)
+            print(f"Summary ready: {talk_dir.name} — {data['title']!r}", flush=True)
+        except Exception as e:
+            print(f"[summary warn] {talk_dir.name}: {e}", flush=True)
+            try:
+                _atomic_write_bytes(talk_dir / "summary.json", json.dumps(
+                    {"status": "failed", "error": str(e),
+                     "title": label or talk_dir.name,
+                     "generated_at": datetime.now().isoformat(timespec="seconds")},
+                    indent=2).encode())
+            except Exception:
+                pass
+        finally:
+            _make_readonly(talk_dir)
+
+
+# ── Saved-talk archive: static serving + summaries page ──────────────────────
+
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+    ".json": "application/json", ".md": "text/plain; charset=utf-8",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+}
+
+# Saved files that contain the full transcript verbatim. These are served only
+# with the admin token (?token=…); the public gets summaries + slides only.
+PRIVATE_FILES = {"transcript.txt", "transcript.html", "session.json"}
+
+
+def _safe_talk_path(rel: str):
+    """Resolve rel under SAVE_DIR, refusing path traversal. Returns an existing
+    file Path, or None."""
+    base = SAVE_DIR.resolve()
+    try:
+        target = (base / rel).resolve()
+    except Exception:
+        return None
+    if target != base and base not in target.parents:
+        return None
+    return target if target.is_file() else None
+
+
+# ── Audience voting on speaker questions ─────────────────────────────────────
+
+def _load_votes(folder: str) -> dict:
+    p = VOTES_DIR / f"{folder}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_votes(folder: str, votes: dict):
+    _atomic_write_bytes(VOTES_DIR / f"{folder}.json", json.dumps(votes).encode())
+
+
+def _apply_vote(folder: str, qid: str, frm: str, to: str):
+    """Move one vote frm→to (each of none/up/down) for a question. Returns the
+    new {up, down} counts, or None if the request is invalid."""
+    if frm not in ("none", "up", "down") or to not in ("none", "up", "down"):
+        return None
+    if not folder or "/" in folder or "\\" in folder or ".." in folder:
+        return None
+    tdir = SAVE_DIR / folder
+    qfile = tdir / "questions.json"
+    if not tdir.is_dir() or not qfile.exists():
+        return None
+    try:
+        valid = {q.get("id") for q in json.loads(qfile.read_text()).get("questions", [])}
+    except Exception:
+        return None
+    if qid not in valid:
+        return None
+    with _votes_lock:
+        votes = _load_votes(folder)
+        cur = votes.get(qid, {"up": 0, "down": 0})
+        cur = {"up": int(cur.get("up", 0)), "down": int(cur.get("down", 0))}
+        if frm in ("up", "down"):
+            cur[frm] = max(0, cur[frm] - 1)
+        if to in ("up", "down"):
+            cur[to] += 1
+        votes[qid] = cur
+        _save_votes(folder, votes)
+    return cur
+
+
+# ── Related-talk similarity ──────────────────────────────────────────────────
+
+_STOPWORDS = {"the", "a", "an", "of", "and", "for", "with", "to", "in", "on", "at", "by",
+              "from", "into", "via", "using", "new", "towards", "toward", "talk", "about",
+              "is", "are", "as", "an", "study", "analysis", "approach"}
+
+
+def _words(s: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _related_talks(t: dict, talks: list, k: int = 3):
+    """Up to k earlier talks most similar to t, by topic + title-word overlap."""
+    cur_topics, cur_title = set(t["topics"]), _words(t["title"])
+    scored = []
+    for o in talks:
+        if o["folder"] == t["folder"] or o["saved_at"] >= t["saved_at"]:
+            continue  # only earlier ("previous") talks
+        s = 0.0
+        ot = set(o["topics"])
+        if cur_topics and ot:
+            s += len(cur_topics & ot) / len(cur_topics | ot)
+        ow = _words(o["title"])
+        if cur_title and ow:
+            s += 0.3 * len(cur_title & ow) / len(cur_title | ow)
+        if s > 0:
+            scored.append((s, o["folder"], o["title"]))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [(f, ti) for _, f, ti in scored[:k]]
+
+
+def _render_related_html(related) -> str:
+    if not related:
+        return ""
+    esc = html.escape
+    links = " · ".join(f'<a href="#{esc(f)}">{esc(ti)}</a>' for f, ti in related)
+    return f'<div class="related">Related talks: {links}</div>'
+
+
+def _render_questions_html(folder: str, questions: list, votes: dict) -> str:
+    if not questions:
+        return ""
+    esc = html.escape
+    rows = []
+    for idx, q in enumerate(questions):
+        qid = q.get("id") or f"q{idx + 1}"
+        v = votes.get(qid, {})
+        up, down = int(v.get("up", 0)), int(v.get("down", 0))
+        rows.append((up - down, idx, qid, q.get("text", ""), up, down))
+    rows.sort(key=lambda r: (-r[0], r[1]))  # most upvotes / least downvotes first
+    items = []
+    for score, idx, qid, text, up, down in rows:
+        items.append(
+            f'<li class="question" data-qid="{esc(qid)}" data-idx="{idx}" data-score="{score}">'
+            f'<span class="qtext">{esc(text)}</span>'
+            f'<span class="qvote">'
+            f'<button class="vb up" onclick="vote(this,\'up\')" aria-label="thumbs up">'
+            f'&#9650; <em>{up}</em></button>'
+            f'<button class="vb down" onclick="vote(this,\'down\')" aria-label="thumbs down">'
+            f'&#9660; <em>{down}</em></button>'
+            f'</span></li>')
+    return (f'<details class="qbox"><summary>Questions for the speaker ({len(questions)})</summary>'
+            f'<ol class="questions" data-folder="{esc(folder)}">{"".join(items)}</ol></details>')
+
+
+SUMMARIES_JS = """<script>
+function applyActive(q, v) {
+  q.querySelector('.vb.up').classList.toggle('on', v === 'up');
+  q.querySelector('.vb.down').classList.toggle('on', v === 'down');
+}
+function resort(list) {
+  Array.from(list.children)
+    .sort((a, b) => (b.dataset.score - a.dataset.score) || (a.dataset.idx - b.dataset.idx))
+    .forEach(i => list.appendChild(i));
+}
+function vote(btn, dir) {
+  const q = btn.closest('.question'), list = btn.closest('.questions');
+  const folder = list.dataset.folder, qid = q.dataset.qid;
+  const key = 'vote:' + folder + ':' + qid;
+  const cur = localStorage.getItem(key) || 'none';
+  const to = (cur === dir) ? 'none' : dir;
+  fetch('/vote', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({folder: folder, qid: qid, from: cur, to: to})})
+    .then(r => r.json()).then(res => {
+      if (!res || res.error) return;
+      localStorage.setItem(key, to);
+      q.querySelector('.vb.up em').textContent = res.up;
+      q.querySelector('.vb.down em').textContent = res.down;
+      q.dataset.score = res.up - res.down;
+      applyActive(q, to);
+      resort(list);
+    }).catch(() => {});
+}
+document.querySelectorAll('.questions').forEach(function (list) {
+  const folder = list.dataset.folder;
+  list.querySelectorAll('.question').forEach(function (q) {
+    applyActive(q, localStorage.getItem('vote:' + folder + ':' + q.dataset.qid) || 'none');
+  });
+});
+</script>"""
+
+
+def render_summaries_page() -> str:
+    talks = []
+    for d in SAVE_DIR.iterdir():
+        if not d.is_dir() or not (d / "metadata.json").exists():
+            continue
+        try:
+            meta = json.loads((d / "metadata.json").read_text())
+        except Exception:
+            meta = {}
+        summary = None
+        if (d / "summary.json").exists():
+            try:
+                summary = json.loads((d / "summary.json").read_text())
+            except Exception:
+                summary = None
+        questions = []
+        if (d / "questions.json").exists():
+            try:
+                questions = json.loads((d / "questions.json").read_text()).get("questions", [])
+            except Exception:
+                questions = []
+        slides = sorted((d / "slides").glob("slide_*.jpg")) if (d / "slides").is_dir() else []
+        talks.append({
+            "folder": d.name, "meta": meta, "summary": summary, "questions": questions,
+            "votes": _load_votes(d.name), "thumb": slides[0].name if slides else None,
+            "saved_at": meta.get("saved_at") or d.name,
+            "title": (summary or {}).get("title") or meta.get("label") or d.name,
+            "topics": [str(x).lower() for x in (summary or {}).get("topics", [])],
+        })
+
+    talks.sort(key=lambda t: t["saved_at"], reverse=True)
+
+    esc = html.escape
+    cards = []
+    for t in talks:
+        folder, fq, summary, thumb = t["folder"], quote(t["folder"]), t["summary"], t["thumb"]
+        title = esc(t["title"])
+        when = esc(t["meta"].get("saved_at", ""))
+        n_slides = t["meta"].get("n_slides", 0)
+        thumb_html = (f'<a class="thumb" href="/talks/{fq}/slides/{quote(thumb)}">'
+                      f'<img src="/talks/{fq}/slides/{quote(thumb)}" loading="lazy"></a>'
+                      if thumb else "")
+        if summary and summary.get("status") == "failed":
+            inner = '<p class="pending">Summary unavailable.</p>'
+        elif summary:
+            speaker = esc(summary.get("speaker") or "")
+            sp = f'<div class="speaker">{speaker}</div>' if speaker else ""
+            abstract = esc(summary.get("abstract") or "")
+            pts = "".join(f"<li>{esc(p)}</li>" for p in summary.get("key_points", []))
+            pts_html = f"<ul>{pts}</ul>" if pts else ""
+            tps = summary.get("topics", [])
+            tps_html = ("<div class='topics'>" +
+                        "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
+            inner = f"{sp}<p class='abstract'>{abstract}</p>{pts_html}{tps_html}"
+        else:
+            inner = '<p class="pending">Summary generating…</p>'
+        related_html = _render_related_html(_related_talks(t, talks))
+        questions_html = _render_questions_html(folder, t["questions"], t["votes"])
+        cards.append(
+            f'<article class="card" id="{esc(folder)}">{thumb_html}<div class="card-body">'
+            f'<h2>{title}</h2><div class="when">{when}</div>{inner}'
+            f'{related_html}{questions_html}'
+            f'<div class="links">{n_slides} slides</div></div></article>')
+
+    body = "\n".join(cards) if cards else '<p class="empty">No talks saved yet.</p>'
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SBI4GALEV — Talk summaries</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ background:#0a0a0a; color:#ddd; font-family:sans-serif; padding:48px 20px 96px; }}
+    .wrap {{ max-width:860px; margin:0 auto; }}
+    header.top {{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:2em; }}
+    header.top h1 {{ font-size:1.3em; font-weight:600; letter-spacing:0.5px; }}
+    header.top a {{ color:#555; font-size:0.7em; letter-spacing:1px; text-decoration:none; }}
+    header.top a:hover {{ color:#aaa; }}
+    .card {{ display:flex; gap:20px; padding:24px 0; border-top:1px solid #1a1a1a; }}
+    .card .thumb {{ flex:0 0 200px; }}
+    .card .thumb img {{ width:100%; border:1px solid #222; border-radius:6px; display:block; }}
+    .card-body {{ flex:1; min-width:0; }}
+    .card h2 {{ font-size:1.05em; font-weight:600; color:#fff; margin-bottom:0.2em; }}
+    .when {{ color:#555; font-size:0.7em; letter-spacing:1px; margin-bottom:0.9em; }}
+    .speaker {{ color:#9a9; font-size:0.85em; margin-bottom:0.6em; }}
+    .abstract {{ color:#bbb; line-height:1.65; margin-bottom:0.8em; }}
+    .card ul {{ margin:0 0 0.8em 1.1em; color:#9a9a9a; line-height:1.6; }}
+    .topics {{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.8em; }}
+    .topics span {{ font-size:0.65em; letter-spacing:1px; color:#777; border:1px solid #262626;
+                    border-radius:10px; padding:2px 9px; }}
+    .links {{ font-size:0.72em; color:#555; }}
+    .links a {{ color:#6a8; text-decoration:none; }}
+    .links a:hover {{ text-decoration:underline; }}
+    .pending {{ color:#666; font-style:italic; }}
+    .empty {{ color:#555; text-align:center; padding:60px 0; }}
+    .related {{ font-size:0.75em; color:#777; margin:0.2em 0 0.9em; }}
+    .related a {{ color:#6a8; text-decoration:none; }}
+    .related a:hover {{ text-decoration:underline; }}
+    details.qbox {{ margin:0.2em 0 0.9em; }}
+    details.qbox > summary {{ cursor:pointer; color:#9a9; font-size:0.8em; letter-spacing:0.5px;
+        list-style:none; user-select:none; }}
+    details.qbox > summary::-webkit-details-marker {{ display:none; }}
+    details.qbox > summary::before {{ content:'▸ '; color:#555; }}
+    details.qbox[open] > summary::before {{ content:'▾ '; }}
+    ol.questions {{ list-style:none; margin:0.7em 0 0; padding:0; }}
+    li.question {{ display:flex; gap:12px; align-items:flex-start; padding:8px 0;
+        border-top:1px solid #161616; }}
+    .qtext {{ flex:1; color:#ccc; line-height:1.5; font-size:0.92em; }}
+    .qvote {{ display:flex; gap:6px; flex:0 0 auto; }}
+    .vb {{ background:#111; border:1px solid #222; color:#888; border-radius:4px;
+        padding:3px 9px; font-size:0.8em; cursor:pointer; white-space:nowrap; }}
+    .vb:hover {{ border-color:#444; color:#ccc; }}
+    .vb.up.on {{ color:#4a4; border-color:#4a4; }}
+    .vb.down.on {{ color:#b55; border-color:#b55; }}
+    .vb em {{ font-style:normal; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top"><h1>SBI4GALEV — Talk summaries</h1><a href="/">← live</a></header>
+    {body}
+  </div>
+  <!--SCRIPT-->
+</body>
+</html>""".replace("<!--SCRIPT-->", SUMMARIES_JS)
 
 
 def _push(event_type, data):
-    item = {"type": event_type, "data": data}
+    item = {"type": event_type, "data": data, "ts": datetime.now().strftime("%H:%M:%S")}
     with _lock:
         _history.append(item)
         for q in _subscribers:
@@ -401,15 +1081,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _html(self, body_str):
+        body = body_str.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == "/":
-            body = HTML.encode()
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self._html(render_page(admin=False))
+        elif parsed.path == "/admin":
+            qs = parse_qs(parsed.query)
+            if qs.get("token", [""])[0] != TOKEN:
+                self.send_error(403)
+                return
+            self._html(render_page(admin=True))
+        elif parsed.path == "/summaries":
+            self._html(render_summaries_page())
+        elif parsed.path.startswith("/talks/"):
+            target = _safe_talk_path(unquote(parsed.path[len("/talks/"):]))
+            if target is None:
+                self.send_error(404)
+                return
+            if target.name in PRIVATE_FILES and parse_qs(parsed.query).get("token", [""])[0] != TOKEN:
+                self.send_error(403)
+                return
+            data = target.read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type",
+                             _CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream"))
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/stream":
+            self.wfile.write(data)
+        elif parsed.path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -426,8 +1133,11 @@ class Handler(BaseHTTPRequestHandler):
                     item = q.get()
                     if item is None:
                         break
-                    if item["type"] == "image":
+                    kind = item["type"]
+                    if kind == "image":
                         self.wfile.write(f"event: image\ndata: {json.dumps(item)}\n\n".encode())
+                    elif kind == "reset":
+                        self.wfile.write(b"event: reset\ndata: {}\n\n")
                     else:
                         self.wfile.write(f"event: chunk\ndata: {item['data']}\n\n".encode())
                     self.wfile.flush()
@@ -440,6 +1150,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path == "/vote":
+            # Public: anyone in the audience may vote on speaker questions.
+            raw = self._read_body()
+            try:
+                body = json.loads(raw or b"{}")
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+            res = _apply_vote(str(body.get("folder", "")), str(body.get("qid", "")),
+                              str(body.get("from", "none")), str(body.get("to", "none")))
+            if res is None:
+                return self._json(400, {"error": "invalid vote"})
+            return self._json(200, res)
         if not self._check_token():
             return
         if self.path == "/transcribe":
@@ -469,16 +1191,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
         elif self.path == "/save":
-            path = _save_transcript()
-            self._json(200, {"saved": str(path)})
-        elif self.path == "/clear":
-            _save_transcript()
-            with _lock:
-                _history.clear()
-                for q in _subscribers:
-                    q.put(None)
-            self.send_response(204)
-            self.end_headers()
+            raw = self._read_body()
+            label = ""
+            if raw:
+                try:
+                    label = str((json.loads(raw) or {}).get("label", "") or "").strip()
+                except Exception:
+                    label = ""
+            try:
+                result = _save_session(label[:80])
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
+            if result is None:
+                return self._json(200, {"saved": None, "reason": "nothing to record"})
+            self._json(200, result)
         else:
             self.send_error(404)
 
@@ -494,6 +1220,8 @@ def main():
     print(f"Model ready. Starting server on port {PORT}...", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Transcript server live at http://0.0.0.0:{PORT}", flush=True)
+    print(f"  public viewer : http://0.0.0.0:{PORT}/", flush=True)
+    print(f"  operator page : http://0.0.0.0:{PORT}/admin?token={TOKEN}", flush=True)
     server.serve_forever()
 
 
