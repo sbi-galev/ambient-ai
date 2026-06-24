@@ -46,6 +46,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -58,12 +59,32 @@ SAVE_DIR.mkdir(exist_ok=True)
 # questions live in a separate writable store, one JSON per talk.
 VOTES_DIR = Path(__file__).parent / "votes"
 VOTES_DIR.mkdir(exist_ok=True)
+# Per-day editorial overviews ("Day 1", "Day 2", …). Generated from the day's
+# talk summaries and cached here (one JSON per calendar date), regenerated in the
+# background when the set of talks for that day changes.
+DAYS_DIR = Path(__file__).parent / "day_summaries"
+DAYS_DIR.mkdir(exist_ok=True)
 
 PORT = int(os.environ.get("TRANSCRIPT_PORT", "7103"))
 TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "sbi4galev")
 DEVICE = os.environ.get("STT_DEVICE", "cuda:0")
 MODEL_NAME = "stt_en_fastconformer_transducer_xxlarge"
 SAMPLE_RATE = 16000
+
+# "End talk & Save" is invariably clicked a beat late — by the time the chair has
+# thanked the speaker and the next one starts, the last few seconds of audio (the
+# next speaker's opening) have already landed in this talk's history. We hold back
+# the most recent SAVE_OFFSET_SECONDS of chunks at save time, leaving them in the
+# live history so they bundle with the *next* talk instead. Set to 0 to disable.
+SAVE_OFFSET_SECONDS = int(os.environ.get("SAVE_OFFSET_SECONDS", "30"))
+
+# Crash safety: the live transcript buffer lives in memory and is only written to
+# disk when a talk is explicitly saved. To survive a crash/restart mid-talk we
+# periodically snapshot the in-memory history to a hidden file under SAVE_DIR and
+# reload it on startup, so the in-progress (unsaved) talk resumes instead of being
+# lost. Set LIVE_FLUSH_SECONDS=0 to disable.
+LIVE_STATE_PATH = SAVE_DIR / ".live.json"
+LIVE_FLUSH_SECONDS = int(os.environ.get("LIVE_FLUSH_SECONDS", "10"))
 
 # Local summarisation model — alan's engine: SGLang serving gemma-4-31b-it on an
 # OpenAI-compatible endpoint. Override via env to repoint at another provider.
@@ -78,6 +99,9 @@ _infer_lock = threading.Lock()
 _save_lock = threading.Lock()
 _summary_lock = threading.Lock()
 _votes_lock = threading.Lock()
+_day_inflight = set()          # calendar dates whose overview is being (re)built
+_day_inflight_lock = threading.Lock()
+_live_dirty = threading.Event()  # set when _history changes; drives the autosave
 _history = []  # list of {"type": "text"|"image", "data": str, "ts": str}
 
 # ── Page template ───────────────────────────────────────────────────────────
@@ -433,6 +457,49 @@ def render_page(admin: bool) -> str:
             .replace("/*ADMIN_JS*/", ""))
 
 
+# ── Live-buffer autosave (crash recovery) ────────────────────────────────────
+
+def _flush_live_state():
+    """Atomically persist the current in-memory history so a crash/restart can
+    resume the in-progress, not-yet-saved talk. A no-op-safe best effort: any
+    failure is logged but never interrupts recording."""
+    with _lock:
+        snapshot = list(_history)
+    try:
+        _atomic_write_bytes(LIVE_STATE_PATH, json.dumps(snapshot).encode())
+    except Exception as e:
+        print(f"[live autosave warn] {e}", flush=True)
+
+
+def _live_autosave_worker():
+    """Background: whenever the history changes, wait a short coalescing window
+    (so a burst of chunks becomes one write) then snapshot to disk."""
+    while True:
+        _live_dirty.wait()
+        _live_dirty.clear()
+        if LIVE_FLUSH_SECONDS > 0:
+            time.sleep(LIVE_FLUSH_SECONDS)
+        _flush_live_state()
+
+
+def _load_live_state():
+    """On startup, restore an in-progress talk left behind by a previous run."""
+    if not LIVE_STATE_PATH.exists():
+        return
+    try:
+        items = json.loads(LIVE_STATE_PATH.read_text())
+    except Exception as e:
+        print(f"[live restore warn] {e}", flush=True)
+        return
+    if isinstance(items, list) and items:
+        with _lock:
+            _history.extend(items)
+        n_txt = sum(1 for it in items if it.get("type") == "text")
+        n_img = sum(1 for it in items if it.get("type") == "image")
+        print(f"Restored in-progress talk from autosave: "
+              f"{n_txt} text chunk(s), {n_img} slide(s)", flush=True)
+
+
 # ── Saving a talk ────────────────────────────────────────────────────────────
 
 def _slugify(label: str) -> str:
@@ -507,13 +574,48 @@ def _render_archive_html(label: str, meta: dict, session: list) -> str:
 """
 
 
+def _ts_to_seconds(ts: str):
+    """'HH:MM:SS' → seconds since midnight, or None if unparseable."""
+    try:
+        h, m, s = (int(p) for p in ts.split(":"))
+        return h * 3600 + m * 60 + s
+    except (ValueError, AttributeError):
+        return None
+
+
+def _split_for_save(history, offset_seconds):
+    """Return (to_save, to_keep): the saved prefix is everything older than
+    `offset_seconds` before the most recent chunk; the recent tail is kept in
+    the live history so it bundles with the next talk. Falls back to saving
+    everything when the offset would leave nothing to save (e.g. a very short
+    talk) so we never silently drop a whole talk."""
+    if offset_seconds <= 0 or not history:
+        return list(history), []
+    last = next((_ts_to_seconds(it.get("ts", "")) for it in reversed(history)
+                 if _ts_to_seconds(it.get("ts", "")) is not None), None)
+    if last is None:
+        return list(history), []
+    cutoff = last - offset_seconds
+    # History is appended in time order, so the kept tail is a suffix; split at
+    # the first chunk whose timestamp falls within the offset window.
+    split = len(history)
+    for i, it in enumerate(history):
+        sec = _ts_to_seconds(it.get("ts", ""))
+        if sec is not None and sec > cutoff:
+            split = i
+            break
+    if split == 0:  # whole talk inside the window — don't drop it
+        return list(history), []
+    return list(history[:split]), list(history[split:])
+
+
 def _save_session(label: str):
     """Bundle the current talk into a dedicated read-only folder, then reset the
     live history for the next speaker. Returns a result dict, or None if there
     was nothing recorded (in which case nothing is written and nothing reset)."""
     with _save_lock:
         with _lock:
-            snapshot = list(_history)
+            snapshot, _ = _split_for_save(_history, SAVE_OFFSET_SECONDS)
 
         texts = [it for it in snapshot if it["type"] == "text"]
         images = [it for it in snapshot if it["type"] == "image"]
@@ -558,11 +660,17 @@ def _save_session(label: str):
         (talk_dir / "transcript.html").write_text(_render_archive_html(label, meta, session))
 
         # Reset for the next speaker: drop exactly the saved prefix (anything
-        # that arrived mid-save is preserved) and tell every viewer to clear.
+        # that arrived mid-save, plus the held-back offset tail, is preserved)
+        # and rebase every viewer onto what remains so the carried-over opening
+        # of the next talk stays on screen rather than vanishing.
         with _lock:
             del _history[:len(snapshot)]
+            carryover = list(_history)
             for q in _subscribers:
-                q.put({"type": "reset"})
+                q.put({"type": "history", "data": carryover})
+        # Persist the post-save buffer now, so a crash right after saving resumes
+        # only the carried-over opening of the next talk, not the talk just saved.
+        _flush_live_state()
 
         # Summarise off the response thread (transcript + slides → alan/gemma),
         # which finalises the folder read-only when done. If summaries are off,
@@ -751,6 +859,10 @@ def _safe_talk_path(rel: str):
         return None
     if target != base and base not in target.parents:
         return None
+    # Never serve hidden files (e.g. the .live.json autosave buffer) or anything
+    # under a hidden directory (.backups/) via the public archive route.
+    if any(part.startswith(".") for part in target.relative_to(base).parts):
+        return None
     return target if target.is_file() else None
 
 
@@ -903,7 +1015,141 @@ document.querySelectorAll('.questions').forEach(function (list) {
 </script>"""
 
 
-def render_summaries_page() -> str:
+# ── Per-day overviews ────────────────────────────────────────────────────────
+
+DAY_SYSTEM = (
+    "You are alan, writing a short editorial overview of a single day of a "
+    "research conference (SBI4GALEV — simulation-based inference for galaxy "
+    "evolution) for a public archive. You are given that day's talks in order, "
+    "each with its title, speaker, abstract and key points (themselves AI "
+    "summaries of automatic transcripts, so expect some noise). Write a faithful, "
+    "concise overview of the day: what ground it covered, how the talks related, "
+    "and the threads running through them. Do not invent talks, results or claims "
+    "not present in the material. "
+    "Respond with ONLY a JSON object (no markdown, no code fences) with keys: "
+    '"overview" (a 3-5 sentence paragraph) and "themes" (array of 3-6 short '
+    "cross-cutting theme strings).")
+
+
+def _talk_day(t: dict) -> str:
+    """Calendar-date key 'YYYY-MM-DD' for a talk, from saved_at or folder name."""
+    sa = t.get("saved_at") or ""
+    if len(sa) >= 10 and sa[4] == "-":
+        return sa[:10]
+    return t["folder"][:10]
+
+
+def _group_by_day(talks: list):
+    """Group talks by date → ordered list of (date, day_label, [talks]); both the
+    days and the talks within each day are in chronological order."""
+    days = {}
+    for t in talks:
+        days.setdefault(_talk_day(t), []).append(t)
+    out = []
+    for i, date in enumerate(sorted(days), start=1):
+        day_talks = sorted(days[date], key=lambda x: x["saved_at"])
+        out.append((date, f"Day {i}", day_talks))
+    return out
+
+
+def _format_day_date(date: str) -> str:
+    try:
+        return datetime.strptime(date, "%Y-%m-%d").strftime("%A %-d %B %Y")
+    except ValueError:
+        return date
+
+
+def _day_signature(day_talks: list) -> str:
+    """A fingerprint of the day's talks + their summary versions, so the overview
+    is regenerated whenever a talk is added, removed or re-summarised."""
+    parts = []
+    for t in sorted(day_talks, key=lambda x: x["folder"]):
+        gen = (t["summary"] or {}).get("generated_at", "") if t["summary"] else ""
+        parts.append(f"{t['folder']}@{gen}")
+    return "|".join(parts)
+
+
+def _load_day_summary(date: str):
+    p = DAYS_DIR / f"{date}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return None
+    return None
+
+
+def _generate_day_summary(date: str, day_label: str, day_talks: list) -> dict:
+    blocks = []
+    for t in day_talks:
+        s = t["summary"] or {}
+        title = s.get("title") or t["title"]
+        line = f"### {title}"
+        if s.get("speaker"):
+            line += f" — {s['speaker']}"
+        if s.get("abstract"):
+            line += f"\n{s['abstract']}"
+        for p in s.get("key_points", []):
+            line += f"\n- {p}"
+        blocks.append(line)
+    user = (f"{day_label} ({_format_day_date(date)}) — {len(day_talks)} talk(s), "
+            f"in order:\n\n" + "\n\n".join(blocks))
+    raw = _llm_chat([{"role": "system", "content": DAY_SYSTEM},
+                     {"role": "user", "content": user}], max_tokens=700)
+    d = _parse_summary_json(raw, day_label)  # tolerant JSON extraction
+    # _parse_summary_json keys off a talk schema; pull what we need from raw too.
+    try:
+        txt = raw.strip()
+        if txt.startswith("```"):
+            txt = re.sub(r"^```[a-zA-Z]*\s*", "", txt)
+            txt = re.sub(r"\s*```$", "", txt).strip()
+        obj = json.loads(txt[txt.find("{"):txt.rfind("}") + 1]) if "{" in txt else {}
+    except Exception:
+        obj = {}
+    overview = str(obj.get("overview") or d.get("abstract") or "").strip()
+    themes = [str(x).strip() for x in (obj.get("themes") or d.get("topics") or []) if str(x).strip()][:6]
+    return {
+        "date": date, "day_label": day_label, "n_talks": len(day_talks),
+        "overview": overview, "themes": themes,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "model": LLM_MODEL,
+    }
+
+
+def _day_worker(date: str, day_label: str, day_talks: list, sig: str):
+    try:
+        data = _generate_day_summary(date, day_label, day_talks)
+        data["signature"] = sig
+        _atomic_write_bytes(DAYS_DIR / f"{date}.json", json.dumps(data, indent=2).encode())
+        print(f"Day overview ready: {date} ({day_label})", flush=True)
+    except Exception as e:
+        print(f"[day overview warn] {date}: {e}", flush=True)
+    finally:
+        with _day_inflight_lock:
+            _day_inflight.discard(date)
+
+
+def _ensure_day_summary(date: str, day_label: str, day_talks: list):
+    """Return the cached day overview if it is fresh for the current set of talks.
+    Otherwise kick off a one-off background regeneration and return whatever we
+    have (a stale overview, or None) so the page renders immediately."""
+    cached = _load_day_summary(date)
+    sig = _day_signature(day_talks)
+    if cached and cached.get("signature") == sig and cached.get("overview"):
+        return cached
+    if SUMMARIES_ENABLED:
+        with _day_inflight_lock:
+            if date not in _day_inflight:
+                _day_inflight.add(date)
+                threading.Thread(target=_day_worker,
+                                 args=(date, day_label, list(day_talks), sig),
+                                 daemon=True).start()
+    return cached
+
+
+# ── Saved-talk archive: page rendering ───────────────────────────────────────
+
+def _load_talks() -> list:
     talks = []
     for d in SAVE_DIR.iterdir():
         if not d.is_dir() or not (d / "metadata.json").exists():
@@ -934,101 +1180,195 @@ def render_summaries_page() -> str:
         })
 
     talks.sort(key=lambda t: t["saved_at"], reverse=True)
+    return talks
 
-    esc = html.escape
-    cards = []
-    for t in talks:
-        folder, fq, summary, thumb = t["folder"], quote(t["folder"]), t["summary"], t["thumb"]
-        title = esc(t["title"])
-        when = esc(t["meta"].get("saved_at", ""))
-        n_slides = t["meta"].get("n_slides", 0)
-        thumb_html = (f'<a class="thumb" href="/talks/{fq}/slides/{quote(thumb)}">'
-                      f'<img src="/talks/{fq}/slides/{quote(thumb)}" loading="lazy"></a>'
-                      if thumb else "")
-        if summary and summary.get("status") == "failed":
-            inner = '<p class="pending">Summary unavailable.</p>'
-        elif summary:
-            speaker = esc(summary.get("speaker") or "")
-            sp = f'<div class="speaker">{speaker}</div>' if speaker else ""
-            abstract = esc(summary.get("abstract") or "")
-            pts = "".join(f"<li>{esc(p)}</li>" for p in summary.get("key_points", []))
-            pts_html = f"<ul>{pts}</ul>" if pts else ""
-            tps = summary.get("topics", [])
-            tps_html = ("<div class='topics'>" +
-                        "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
-            inner = f"{sp}<p class='abstract'>{abstract}</p>{pts_html}{tps_html}"
-        else:
-            inner = '<p class="pending">Summary generating…</p>'
-        related_html = _render_related_html(_related_talks(t, talks))
-        questions_html = _render_questions_html(folder, t["questions"], t["votes"])
-        cards.append(
-            f'<article class="card" id="{esc(folder)}">{thumb_html}<div class="card-body">'
-            f'<h2>{title}</h2><div class="when">{when}</div>{inner}'
-            f'{related_html}{questions_html}'
-            f'<div class="links">{n_slides} slides</div></div></article>')
 
-    body = "\n".join(cards) if cards else '<p class="empty">No talks saved yet.</p>'
+SUMMARIES_CSS = """
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background:#0a0a0a; color:#ddd; font-family:sans-serif; padding:48px 20px 96px; }
+    .wrap { max-width:860px; margin:0 auto; }
+    header.top { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:2em; }
+    header.top h1 { font-size:1.3em; font-weight:600; letter-spacing:0.5px; }
+    header.top .navlinks a { color:#555; font-size:0.7em; letter-spacing:1px; text-decoration:none; margin-left:14px; }
+    header.top .navlinks a:hover { color:#aaa; }
+    .day { padding:28px 0; border-top:1px solid #1a1a1a; }
+    .day-head { display:flex; align-items:baseline; gap:14px; margin-bottom:0.2em; }
+    .day-head h2 { font-size:1.15em; font-weight:700; color:#fff; letter-spacing:0.5px; }
+    .day-head .date { color:#777; font-size:0.8em; }
+    .day-head .count { color:#555; font-size:0.72em; letter-spacing:1px; margin-left:auto; }
+    .day-overview { color:#cfcfcf; line-height:1.7; margin:0.7em 0 0.9em; }
+    .day-thumbs { display:flex; gap:8px; overflow:hidden; margin:0.6em 0 0.9em; }
+    .day-thumbs img { height:74px; border:1px solid #222; border-radius:4px; display:block; }
+    .day-talklist { list-style:none; margin:0.4em 0 0; padding:0; }
+    .day-talklist li { padding:5px 0; border-top:1px solid #141414; font-size:0.92em; }
+    .day-talklist a { color:#cdd; text-decoration:none; }
+    .day-talklist a:hover { color:#fff; }
+    .day-talklist .who { color:#777; font-size:0.85em; }
+    .day-more { display:inline-block; margin-top:0.9em; color:#6a8; font-size:0.8em;
+                text-decoration:none; letter-spacing:0.5px; }
+    .day-more:hover { text-decoration:underline; }
+    .day-page-overview { color:#cfcfcf; line-height:1.75; margin:0.4em 0 0.6em; font-size:1.02em; }
+    .card { display:flex; gap:20px; padding:24px 0; border-top:1px solid #1a1a1a; }
+    .card .thumb { flex:0 0 200px; }
+    .card .thumb img { width:100%; border:1px solid #222; border-radius:6px; display:block; }
+    .card-body { flex:1; min-width:0; }
+    .card h2 { font-size:1.05em; font-weight:600; color:#fff; margin-bottom:0.2em; }
+    .when { color:#555; font-size:0.7em; letter-spacing:1px; margin-bottom:0.9em; }
+    .speaker { color:#9a9; font-size:0.85em; margin-bottom:0.6em; }
+    .abstract { color:#bbb; line-height:1.65; margin-bottom:0.8em; }
+    .card ul { margin:0 0 0.8em 1.1em; color:#9a9a9a; line-height:1.6; }
+    .topics { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.8em; }
+    .topics span { font-size:0.65em; letter-spacing:1px; color:#777; border:1px solid #262626;
+                    border-radius:10px; padding:2px 9px; }
+    .links { font-size:0.72em; color:#555; }
+    .links a { color:#6a8; text-decoration:none; }
+    .links a:hover { text-decoration:underline; }
+    .pending { color:#666; font-style:italic; }
+    .empty { color:#555; text-align:center; padding:60px 0; }
+    .related { font-size:0.75em; color:#777; margin:0.2em 0 0.9em; }
+    .related a { color:#6a8; text-decoration:none; }
+    .related a:hover { text-decoration:underline; }
+    details.qbox { margin:0.2em 0 0.9em; }
+    details.qbox > summary { cursor:pointer; color:#9a9; font-size:0.8em; letter-spacing:0.5px;
+        list-style:none; user-select:none; }
+    details.qbox > summary::-webkit-details-marker { display:none; }
+    details.qbox > summary::before { content:'▸ '; color:#555; }
+    details.qbox[open] > summary::before { content:'▾ '; }
+    ol.questions { list-style:none; margin:0.7em 0 0; padding:0; }
+    li.question { display:flex; gap:12px; align-items:flex-start; padding:8px 0;
+        border-top:1px solid #161616; }
+    .qtext { flex:1; color:#ccc; line-height:1.5; font-size:0.92em; }
+    .qvote { display:flex; gap:6px; flex:0 0 auto; }
+    .vb { background:#111; border:1px solid #222; color:#888; border-radius:4px;
+        padding:3px 9px; font-size:0.8em; cursor:pointer; white-space:nowrap; }
+    .vb:hover { border-color:#444; color:#ccc; }
+    .vb.up.on { color:#4a4; border-color:#4a4; }
+    .vb.down.on { color:#b55; border-color:#b55; }
+    .vb em { font-style:normal; }"""
+
+
+def _page_shell(title: str, heading: str, nav_html: str, body: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SBI4GALEV — Talk summaries</title>
-  <style>
-    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ background:#0a0a0a; color:#ddd; font-family:sans-serif; padding:48px 20px 96px; }}
-    .wrap {{ max-width:860px; margin:0 auto; }}
-    header.top {{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:2em; }}
-    header.top h1 {{ font-size:1.3em; font-weight:600; letter-spacing:0.5px; }}
-    header.top a {{ color:#555; font-size:0.7em; letter-spacing:1px; text-decoration:none; }}
-    header.top a:hover {{ color:#aaa; }}
-    .card {{ display:flex; gap:20px; padding:24px 0; border-top:1px solid #1a1a1a; }}
-    .card .thumb {{ flex:0 0 200px; }}
-    .card .thumb img {{ width:100%; border:1px solid #222; border-radius:6px; display:block; }}
-    .card-body {{ flex:1; min-width:0; }}
-    .card h2 {{ font-size:1.05em; font-weight:600; color:#fff; margin-bottom:0.2em; }}
-    .when {{ color:#555; font-size:0.7em; letter-spacing:1px; margin-bottom:0.9em; }}
-    .speaker {{ color:#9a9; font-size:0.85em; margin-bottom:0.6em; }}
-    .abstract {{ color:#bbb; line-height:1.65; margin-bottom:0.8em; }}
-    .card ul {{ margin:0 0 0.8em 1.1em; color:#9a9a9a; line-height:1.6; }}
-    .topics {{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.8em; }}
-    .topics span {{ font-size:0.65em; letter-spacing:1px; color:#777; border:1px solid #262626;
-                    border-radius:10px; padding:2px 9px; }}
-    .links {{ font-size:0.72em; color:#555; }}
-    .links a {{ color:#6a8; text-decoration:none; }}
-    .links a:hover {{ text-decoration:underline; }}
-    .pending {{ color:#666; font-style:italic; }}
-    .empty {{ color:#555; text-align:center; padding:60px 0; }}
-    .related {{ font-size:0.75em; color:#777; margin:0.2em 0 0.9em; }}
-    .related a {{ color:#6a8; text-decoration:none; }}
-    .related a:hover {{ text-decoration:underline; }}
-    details.qbox {{ margin:0.2em 0 0.9em; }}
-    details.qbox > summary {{ cursor:pointer; color:#9a9; font-size:0.8em; letter-spacing:0.5px;
-        list-style:none; user-select:none; }}
-    details.qbox > summary::-webkit-details-marker {{ display:none; }}
-    details.qbox > summary::before {{ content:'▸ '; color:#555; }}
-    details.qbox[open] > summary::before {{ content:'▾ '; }}
-    ol.questions {{ list-style:none; margin:0.7em 0 0; padding:0; }}
-    li.question {{ display:flex; gap:12px; align-items:flex-start; padding:8px 0;
-        border-top:1px solid #161616; }}
-    .qtext {{ flex:1; color:#ccc; line-height:1.5; font-size:0.92em; }}
-    .qvote {{ display:flex; gap:6px; flex:0 0 auto; }}
-    .vb {{ background:#111; border:1px solid #222; color:#888; border-radius:4px;
-        padding:3px 9px; font-size:0.8em; cursor:pointer; white-space:nowrap; }}
-    .vb:hover {{ border-color:#444; color:#ccc; }}
-    .vb.up.on {{ color:#4a4; border-color:#4a4; }}
-    .vb.down.on {{ color:#b55; border-color:#b55; }}
-    .vb em {{ font-style:normal; }}
-  </style>
+  <title>{html.escape(title)}</title>
+  <style>{SUMMARIES_CSS}</style>
 </head>
 <body>
   <div class="wrap">
-    <header class="top"><h1>SBI4GALEV — Talk summaries</h1><a href="/">← live</a></header>
+    <header class="top"><h1>{heading}</h1><div class="navlinks">{nav_html}</div></header>
     {body}
   </div>
-  <!--SCRIPT-->
+  {SUMMARIES_JS}
 </body>
-</html>""".replace("<!--SCRIPT-->", SUMMARIES_JS)
+</html>"""
+
+
+def _render_talk_card(t: dict, all_talks: list) -> str:
+    esc = html.escape
+    folder, fq, summary, thumb = t["folder"], quote(t["folder"]), t["summary"], t["thumb"]
+    title = esc(t["title"])
+    when = esc(t["meta"].get("saved_at", ""))
+    n_slides = t["meta"].get("n_slides", 0)
+    thumb_html = (f'<a class="thumb" href="/talks/{fq}/slides/{quote(thumb)}">'
+                  f'<img src="/talks/{fq}/slides/{quote(thumb)}" loading="lazy"></a>'
+                  if thumb else "")
+    if summary and summary.get("status") == "failed":
+        inner = '<p class="pending">Summary unavailable.</p>'
+    elif summary:
+        speaker = esc(summary.get("speaker") or "")
+        sp = f'<div class="speaker">{speaker}</div>' if speaker else ""
+        abstract = esc(summary.get("abstract") or "")
+        pts = "".join(f"<li>{esc(p)}</li>" for p in summary.get("key_points", []))
+        pts_html = f"<ul>{pts}</ul>" if pts else ""
+        tps = summary.get("topics", [])
+        tps_html = ("<div class='topics'>" +
+                    "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
+        inner = f"{sp}<p class='abstract'>{abstract}</p>{pts_html}{tps_html}"
+    else:
+        inner = '<p class="pending">Summary generating…</p>'
+    related_html = _render_related_html(_related_talks(t, all_talks))
+    questions_html = _render_questions_html(folder, t["questions"], t["votes"])
+    return (f'<article class="card" id="{esc(folder)}">{thumb_html}<div class="card-body">'
+            f'<h2>{title}</h2><div class="when">{when}</div>{inner}'
+            f'{related_html}{questions_html}'
+            f'<div class="links">{n_slides} slides</div></div></article>')
+
+
+def _render_day_overview(day_summary, n_talks: int, on_index: bool) -> str:
+    """The editorial paragraph + theme chips for a day. `on_index` picks the
+    slightly smaller styling used in the day list vs. the full day page."""
+    cls = "day-overview" if on_index else "day-page-overview"
+    if not day_summary or not day_summary.get("overview"):
+        return f'<p class="pending {cls}">Day overview generating…</p>'
+    esc = html.escape
+    out = f'<p class="{cls}">{esc(day_summary["overview"])}</p>'
+    themes = day_summary.get("themes", [])
+    if themes:
+        out += ("<div class='topics'>" +
+                "".join(f"<span>{esc(x)}</span>" for x in themes) + "</div>")
+    return out
+
+
+def render_day_page(date: str) -> str:
+    talks = _load_talks()
+    grouped = _group_by_day(talks)
+    match = next(((dt, label, dtalks) for dt, label, dtalks in grouped if dt == date), None)
+    nav = '<a href="/summaries">← all days</a><a href="/">live</a>'
+    if match is None:
+        return _page_shell("SBI4GALEV — Day not found", "SBI4GALEV", nav,
+                           '<p class="empty">No talks recorded for this day.</p>')
+    _, day_label, day_talks = match
+    day_summary = _ensure_day_summary(date, day_label, day_talks)
+    heading = f"{day_label} <span style='color:#555;font-weight:400;font-size:0.7em'>{html.escape(_format_day_date(date))}</span>"
+    overview = _render_day_overview(day_summary, len(day_talks), on_index=False)
+    # Cards in talk order for the day (oldest first → as the day unfolded).
+    cards = "\n".join(_render_talk_card(t, talks) for t in day_talks)
+    body = f'<div class="day-page-head">{overview}</div>{cards}'
+    return _page_shell(f"SBI4GALEV — {day_label}", heading, nav, body)
+
+
+def render_summaries_page() -> str:
+    """Index of conference days: each day shows its editorial overview, a slide
+    strip and the day's talk list, linking through to the full day page."""
+    talks = _load_talks()
+    grouped = _group_by_day(talks)
+    esc = html.escape
+    nav = '<a href="/">← live</a>'
+    if not grouped:
+        return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
+                           '<p class="empty">No talks saved yet.</p>')
+
+    blocks = []
+    for date, day_label, day_talks in reversed(grouped):  # most recent day first
+        day_summary = _ensure_day_summary(date, day_label, day_talks)
+        overview = _render_day_overview(day_summary, len(day_talks), on_index=True)
+        thumbs = "".join(
+            f'<img src="/talks/{quote(t["folder"])}/slides/{quote(t["thumb"])}" loading="lazy">'
+            for t in day_talks if t["thumb"])
+        thumbs_html = f'<div class="day-thumbs">{thumbs}</div>' if thumbs else ""
+        items = []
+        for t in day_talks:
+            who = (t["summary"] or {}).get("speaker") or ""
+            who_html = f' <span class="who">— {esc(who)}</span>' if who else ""
+            items.append(
+                f'<li><a href="/summaries/{quote(date)}#{esc(t["folder"])}">{esc(t["title"])}</a>'
+                f'{who_html}</li>')
+        n = len(day_talks)
+        blocks.append(
+            f'<section class="day">'
+            f'<div class="day-head"><h2>{day_label}</h2>'
+            f'<span class="date">{esc(_format_day_date(date))}</span>'
+            f'<span class="count">{n} talk{"s" if n != 1 else ""}</span></div>'
+            f'{overview}{thumbs_html}'
+            f'<ul class="day-talklist">{"".join(items)}</ul>'
+            f'<a class="day-more" href="/summaries/{quote(date)}">View {day_label} in full →</a>'
+            f'</section>')
+
+    return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
+                       "\n".join(blocks))
 
 
 def _push(event_type, data):
@@ -1037,6 +1377,7 @@ def _push(event_type, data):
         _history.append(item)
         for q in _subscribers:
             q.put(item)
+    _live_dirty.set()
 
 
 def _to_wav16k(raw):
@@ -1101,6 +1442,12 @@ class Handler(BaseHTTPRequestHandler):
             self._html(render_page(admin=True))
         elif parsed.path == "/summaries":
             self._html(render_summaries_page())
+        elif parsed.path.startswith("/summaries/"):
+            date = unquote(parsed.path[len("/summaries/"):]).strip("/")
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                self.send_error(404)
+                return
+            self._html(render_day_page(date))
         elif parsed.path.startswith("/talks/"):
             target = _safe_talk_path(unquote(parsed.path[len("/talks/"):]))
             if target is None:
@@ -1136,6 +1483,8 @@ class Handler(BaseHTTPRequestHandler):
                     kind = item["type"]
                     if kind == "image":
                         self.wfile.write(f"event: image\ndata: {json.dumps(item)}\n\n".encode())
+                    elif kind == "history":
+                        self.wfile.write(f"event: history\ndata: {json.dumps(item['data'])}\n\n".encode())
                     elif kind == "reset":
                         self.wfile.write(b"event: reset\ndata: {}\n\n")
                     else:
@@ -1182,6 +1531,7 @@ class Handler(BaseHTTPRequestHandler):
                 _history.append(item)
                 for q in _subscribers:
                     q.put(item)
+            _live_dirty.set()
             self.send_response(204)
             self.end_headers()
         elif self.path == "/push":
@@ -1218,6 +1568,10 @@ def main():
     print(f"Loading {MODEL_NAME} on {DEVICE}...", flush=True)
     _model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME, map_location=DEVICE)
     print(f"Model ready. Starting server on port {PORT}...", flush=True)
+    # Resume an in-progress talk left over from a previous run, then start the
+    # autosave loop that keeps the live buffer crash-recoverable.
+    _load_live_state()
+    threading.Thread(target=_live_autosave_worker, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Transcript server live at http://0.0.0.0:{PORT}", flush=True)
     print(f"  public viewer : http://0.0.0.0:{PORT}/", flush=True)

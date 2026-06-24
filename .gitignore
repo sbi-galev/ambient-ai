@@ -3,3 +3,6 @@ __pycache__/
 *.log
 *.err
 transcripts/
+day_summaries/
+votes/
+.claude/settings.local.json
