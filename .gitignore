@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+*.err
+transcripts/
+day_summaries/
+topic_summaries/
+votes/
+.claude/settings.local.json
