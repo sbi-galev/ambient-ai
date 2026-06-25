@@ -4,5 +4,6 @@ __pycache__/
 *.err
 transcripts/
 day_summaries/
+topic_summaries/
 votes/
 .claude/settings.local.json

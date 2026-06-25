@@ -64,6 +64,14 @@ VOTES_DIR.mkdir(exist_ok=True)
 # background when the set of talks for that day changes.
 DAYS_DIR = Path(__file__).parent / "day_summaries"
 DAYS_DIR.mkdir(exist_ok=True)
+# Conference-wide "key topics": a single synthesis across every saved talk that
+# clusters their topic tags into the meeting's main threads, links each back to
+# the talks that raised it, and powers the /topics graph. Cached as one JSON,
+# regenerated in the background when the set of talks (or their summaries) changes.
+TOPICS_DIR = Path(__file__).parent / "topic_summaries"
+TOPICS_DIR.mkdir(exist_ok=True)
+TOPICS_PATH = TOPICS_DIR / "topics.json"
+TOPICS_MAX = int(os.environ.get("TOPICS_MAX", "14"))
 
 PORT = int(os.environ.get("TRANSCRIPT_PORT", "7103"))
 TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "sbi4galev")
@@ -101,6 +109,9 @@ _summary_lock = threading.Lock()
 _votes_lock = threading.Lock()
 _day_inflight = set()          # calendar dates whose overview is being (re)built
 _day_inflight_lock = threading.Lock()
+_topics_lock = threading.Lock()
+_topics_inflight = False        # True while the key-topics synthesis is running
+_topics_started_at = 0.0        # epoch the in-flight synthesis began (drives the timer)
 _live_dirty = threading.Event()  # set when _history changes; drives the autosave
 _history = []  # list of {"type": "text"|"image", "data": str, "ts": str}
 
@@ -208,18 +219,21 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }
     .nav-dot.active { background: #888; }
 
-    #archive-link {
+    #toplinks {
       position: fixed; top: 16px; left: 20px; z-index: 100;
+      display: flex; gap: 14px;
+    }
+    #toplinks a {
       font-size: 0.65em; color: #444; letter-spacing: 1px; text-decoration: none;
     }
-    #archive-link:hover { color: #aaa; }
+    #toplinks a:hover { color: #aaa; }
     /*ADMIN_CSS*/
   </style>
 </head>
 <body>
   <div id="container"></div>
   <div id="status">connecting…</div>
-  <a id="archive-link" href="/summaries">▤ summaries</a>
+  <div id="toplinks"><a href="/summaries">▤ summaries</a><a href="/topics">✦ topics</a></div>
   <!--ADMIN_HTML-->
   <div id="nav"></div>
 
@@ -1147,6 +1161,210 @@ def _ensure_day_summary(date: str, day_label: str, day_talks: list):
     return cached
 
 
+# ── Conference-wide key topics ───────────────────────────────────────────────
+# A synthesis across every saved talk: the per-talk topic keywords are clustered
+# (by the LLM, or by exact keyword when it is unavailable) into the conference's
+# main threads. Each topic is grounded back to the real talks that tagged it, and
+# topics that co-occur in a talk become linked nodes in the /topics graph.
+
+TOPICS_SYSTEM = (
+    "You are alan, distilling the key topics of a research conference (SBI4GALEV — "
+    "simulation-based inference for galaxy evolution) for a public archive. You are "
+    "given the list of talks so far and a vocabulary of topic keywords drawn from "
+    "their summaries (themselves AI summaries of automatic transcripts, so expect "
+    "noise, duplicates and spelling variants). Cluster the keywords into the "
+    "conference's main topics, merging synonyms and variants (e.g. 'amortised' and "
+    "'amortized inference', or 'SBI' and 'simulation-based inference') into a single "
+    "topic. For each topic give a short, specific display name and a one-sentence "
+    "description of what it covers, grounded only in the supplied material — do not "
+    "invent topics or claims. Use only keywords from the supplied vocabulary, and "
+    "assign each keyword to at most one topic; it is fine to leave marginal keywords "
+    "out. Order topics from most to least central to the conference. "
+    "Respond with ONLY a JSON object (no markdown, no code fences) with key "
+    '"topics": an array of objects, each with keys "name" (string), "description" '
+    '(one sentence string) and "keywords" (array of strings drawn only from the '
+    "supplied vocabulary).")
+
+
+def _topics_signature(talks: list) -> str:
+    """Fingerprint of every talk + its summary version (same scheme as the per-day
+    overviews) so the synthesis is rebuilt whenever a talk is added, removed or
+    re-summarised."""
+    return _day_signature(talks)
+
+
+def _topic_vocab(talks: list):
+    """Distinct topic keywords across all talks → (sorted vocab, {kw: set(folders)})."""
+    kw_to_folders = {}
+    for t in talks:
+        for kw in t["topics"]:          # already lower-cased in _load_talks
+            kw = kw.strip()
+            if kw:
+                kw_to_folders.setdefault(kw, set()).add(t["folder"])
+    return sorted(kw_to_folders), kw_to_folders
+
+
+def _parse_topics_json(raw: str) -> list:
+    """Extract the clusters array from the model reply, tolerant of code fences and
+    chatter. Returns a list (possibly empty)."""
+    txt = raw.strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z]*\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt).strip()
+    candidates = [txt]
+    if "{" in txt and "}" in txt:
+        candidates.append(txt[txt.find("{"):txt.rfind("}") + 1])
+    if "[" in txt and "]" in txt:
+        candidates.append(txt[txt.find("["):txt.rfind("]") + 1])
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("topics"), list):
+            return obj["topics"]
+        if isinstance(obj, list):
+            return obj
+    return []
+
+
+def _keyword_fallback_clusters(vocab: list, kw_to_folders: dict) -> list:
+    """LLM-free fallback: each distinct keyword becomes a topic (ranked later by how
+    many talks use it). Keeps /topics working when the model is unavailable."""
+    return [{"name": kw, "description": "", "keywords": [kw]}
+            for kw in sorted(vocab, key=lambda k: (-len(kw_to_folders[k]), k))]
+
+
+def _resolve_topic_clusters(clusters: list, kw_to_folders: dict, talks: list):
+    """Turn [{name, description, keywords}] into ranked topic dicts with grounded
+    talk references and co-occurrence edges. A topic's talks are the union of the
+    talks tagged with any of its keywords, so every reference is real. Drops topics
+    that match no talk, de-duplicates by name, and caps at TOPICS_MAX."""
+    by_folder = {t["folder"]: t for t in talks}
+    topics, seen = [], set()
+    for c in clusters:
+        name = str((c or {}).get("name") or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        kws, kwseen = [], set()
+        for k in (c.get("keywords") or []):
+            k = str(k).strip().lower()
+            if k in kw_to_folders and k not in kwseen:
+                kws.append(k)
+                kwseen.add(k)
+        folders = set()
+        for k in kws:
+            folders |= kw_to_folders[k]
+        if not folders:
+            continue
+        seen.add(name.lower())
+        refs = sorted(
+            ({"folder": f, "title": by_folder[f]["title"], "date": _talk_day(by_folder[f])}
+             for f in folders),
+            key=lambda r: r["title"].lower())
+        topics.append({"name": name, "description": str(c.get("description") or "").strip(),
+                       "keywords": kws, "talks": refs, "count": len(refs), "_folders": folders})
+    topics.sort(key=lambda x: (-x["count"], x["name"].lower()))
+    topics = topics[:TOPICS_MAX]
+    edges = []
+    for i in range(len(topics)):
+        for j in range(i + 1, len(topics)):
+            w = len(topics[i]["_folders"] & topics[j]["_folders"])
+            if w:
+                edges.append({"source": i, "target": j, "weight": w})
+    for tp in topics:
+        del tp["_folders"]
+    return topics, edges
+
+
+def _generate_topics_summary(talks: list, use_llm: bool) -> dict:
+    t0 = time.time()
+    vocab, kw_to_folders = _topic_vocab(talks)
+    clusters, source = [], "keywords"
+    if use_llm and vocab:
+        lines = "\n".join(f"{i + 1}. {t['title']}" for i, t in enumerate(talks))
+        user = (f"{len(talks)} talks so far:\n{lines}\n\n"
+                f"Topic keyword vocabulary ({len(vocab)} terms):\n{', '.join(vocab)}\n\n"
+                f"Cluster these into at most {TOPICS_MAX} key topics of the conference, "
+                "as instructed.")
+        try:
+            raw = _llm_chat([{"role": "system", "content": TOPICS_SYSTEM},
+                             {"role": "user", "content": user}], max_tokens=1300)
+            clusters = _parse_topics_json(raw)
+            if clusters:
+                source = "llm"
+        except Exception as e:
+            print(f"[topics warn] LLM synthesis failed: {e}", flush=True)
+    if not clusters:
+        clusters = _keyword_fallback_clusters(vocab, kw_to_folders)
+    topics, edges = _resolve_topic_clusters(clusters, kw_to_folders, talks)
+    return {
+        "topics": topics, "edges": edges,
+        "n_talks": len(talks), "n_keywords": len(vocab), "source": source,
+        "duration_seconds": round(time.time() - t0, 1),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "model": LLM_MODEL if source == "llm" else "keyword aggregation",
+    }
+
+
+def _load_topics_summary():
+    if TOPICS_PATH.exists():
+        try:
+            return json.loads(TOPICS_PATH.read_text())
+        except Exception:
+            return None
+    return None
+
+
+def _topics_worker(talks: list, sig: str, use_llm: bool):
+    global _topics_inflight
+    try:
+        data = _generate_topics_summary(talks, use_llm)
+        data["signature"] = sig
+        _atomic_write_bytes(TOPICS_PATH, json.dumps(data, indent=2).encode())
+        print(f"Key topics ready: {len(data['topics'])} topics, {len(data['edges'])} "
+              f"links ({data['source']}, {data['duration_seconds']}s)", flush=True)
+    except Exception as e:
+        print(f"[topics warn] {e}", flush=True)
+    finally:
+        with _topics_lock:
+            _topics_inflight = False
+
+
+def _ensure_topics_summary(talks: list):
+    """Return the cached synthesis if fresh for the current talks. Otherwise kick
+    off a single background (re)build and return what we have (a stale synthesis,
+    or None) so the page renders its timer immediately."""
+    global _topics_inflight, _topics_started_at
+    cached = _load_topics_summary()
+    sig = _topics_signature(talks)
+    if cached and cached.get("signature") == sig and "topics" in cached:
+        return cached
+    with _topics_lock:
+        if not _topics_inflight:
+            _topics_inflight = True
+            _topics_started_at = time.time()
+            threading.Thread(target=_topics_worker,
+                             args=(list(talks), sig, SUMMARIES_ENABLED),
+                             daemon=True).start()
+    return cached
+
+
+def _topics_status(talks: list) -> dict:
+    """Lightweight JSON for the /topics poller: whether the synthesis is ready or
+    still running (with elapsed seconds, to drive the on-page timer)."""
+    cached = _load_topics_summary()
+    sig = _topics_signature(talks)
+    fresh = bool(cached and cached.get("signature") == sig and "topics" in cached)
+    with _topics_lock:
+        inflight, started = _topics_inflight, _topics_started_at
+    if fresh and not inflight:
+        return {"status": "ready"}
+    if inflight:
+        return {"status": "generating", "elapsed": round(max(0.0, time.time() - started), 1)}
+    return {"status": "generating", "elapsed": 0.0}
+
+
 # ── Saved-talk archive: page rendering ───────────────────────────────────────
 
 def _load_talks() -> list:
@@ -1244,7 +1462,35 @@ SUMMARIES_CSS = """
     .vb:hover { border-color:#444; color:#ccc; }
     .vb.up.on { color:#4a4; border-color:#4a4; }
     .vb.down.on { color:#b55; border-color:#b55; }
-    .vb em { font-style:normal; }"""
+    .vb em { font-style:normal; }
+    .topics-meta { color:#666; font-size:0.75em; letter-spacing:0.5px; margin:0.4em 0 1.6em; }
+    .topics-meta .timer { color:#9a9; font-variant-numeric:tabular-nums; }
+    #topic-graph-wrap { position:relative; margin:0.4em 0 2.2em; }
+    #topic-graph { width:100%; height:460px; display:block; background:#0c0c0c;
+        border:1px solid #1a1a1a; border-radius:8px; cursor:grab; touch-action:none; }
+    #topic-graph.dragging { cursor:grabbing; }
+    .graph-hint { position:absolute; top:10px; right:14px; color:#3d3d3d; font-size:0.66em;
+        letter-spacing:1px; pointer-events:none; }
+    .tcard { padding:18px 0; border-top:1px solid #1a1a1a; }
+    .tcard.flash { animation:tflash 1.1s ease; }
+    @keyframes tflash { from { background:#181818; } to { background:transparent; } }
+    .tcard h2 { font-size:1.02em; font-weight:600; color:#fff; margin-bottom:0.25em;
+        display:flex; align-items:baseline; gap:10px; }
+    .tcard h2 .n { color:#555; font-size:0.62em; font-weight:400; letter-spacing:1px; }
+    .tcard .tdesc { color:#bbb; line-height:1.65; margin-bottom:0.5em; }
+    .tcard .tkw { color:#5f5f5f; font-size:0.72em; letter-spacing:0.5px; margin-bottom:0.5em; }
+    .tcard .ttalks { list-style:none; margin:0; padding:0; }
+    .tcard .ttalks li { padding:3px 0; font-size:0.9em; }
+    .tcard .ttalks a { color:#cdd; text-decoration:none; }
+    .tcard .ttalks a:hover { color:#fff; }
+    .generating { text-align:center; color:#888; padding:72px 0; }
+    .generating .timer { font-size:2.3em; color:#cdd; font-variant-numeric:tabular-nums;
+        display:block; margin:0.35em 0; letter-spacing:1px; }
+    .generating .sub { font-size:0.78em; color:#555; letter-spacing:1px; }
+    .spinner { display:inline-block; width:13px; height:13px; border:2px solid #2c2c2c;
+        border-top-color:#9a9; border-radius:50%; animation:spin 0.8s linear infinite;
+        vertical-align:middle; margin-right:8px; }
+    @keyframes spin { to { transform:rotate(360deg); } }"""
 
 
 def _page_shell(title: str, heading: str, nav_html: str, body: str) -> str:
@@ -1316,7 +1562,7 @@ def render_day_page(date: str) -> str:
     talks = _load_talks()
     grouped = _group_by_day(talks)
     match = next(((dt, label, dtalks) for dt, label, dtalks in grouped if dt == date), None)
-    nav = '<a href="/summaries">← all days</a><a href="/">live</a>'
+    nav = '<a href="/summaries">← all days</a><a href="/topics">key topics</a><a href="/">live</a>'
     if match is None:
         return _page_shell("SBI4GALEV — Day not found", "SBI4GALEV", nav,
                            '<p class="empty">No talks recorded for this day.</p>')
@@ -1336,7 +1582,7 @@ def render_summaries_page() -> str:
     talks = _load_talks()
     grouped = _group_by_day(talks)
     esc = html.escape
-    nav = '<a href="/">← live</a>'
+    nav = '<a href="/topics">key topics</a><a href="/">← live</a>'
     if not grouped:
         return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
                            '<p class="empty">No talks saved yet.</p>')
@@ -1369,6 +1615,270 @@ def render_summaries_page() -> str:
 
     return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
                        "\n".join(blocks))
+
+
+# ── Key-topics page (graph + cards + generation timer) ───────────────────────
+
+TOPIC_GRAPH_JS = """<script>
+(function () {
+  var canvas = document.getElementById('topic-graph');
+  var holder = document.getElementById('graph-data');
+  if (!canvas || !holder) return;
+  var data; try { data = JSON.parse(holder.textContent); } catch (e) { return; }
+  var nodes = data.nodes || [], links = data.links || [], N = nodes.length;
+  if (N < 2) return;
+
+  var maxC = 1;
+  nodes.forEach(function (n) { maxC = Math.max(maxC, n.count || 1); });
+  nodes.forEach(function (n, i) {
+    n.r = 9 + 17 * Math.sqrt((n.count || 1) / maxC);
+    n.hue = Math.round(360 * i / N);
+  });
+
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  function resize() {
+    W = canvas.clientWidth || 600; H = canvas.clientHeight || 460;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  resize();
+  nodes.forEach(function (n, i) {
+    var a = 2 * Math.PI * i / N, R = Math.min(W, H) * 0.32;
+    n.x = W / 2 + Math.cos(a) * R; n.y = H / 2 + Math.sin(a) * R; n.vx = 0; n.vy = 0;
+  });
+
+  var alpha = 1, hover = -1, drag = -1, dragMoved = false, downX = 0, downY = 0, rafId = null;
+
+  function tick() {
+    var i, j;
+    for (i = 0; i < N; i++) {
+      for (j = i + 1; j < N; j++) {
+        var dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
+        var d2 = dx * dx + dy * dy || 0.01, d = Math.sqrt(d2), f = 2800 / d2;
+        var ux = dx / d, uy = dy / d;
+        nodes[i].vx -= ux * f; nodes[i].vy -= uy * f;
+        nodes[j].vx += ux * f; nodes[j].vy += uy * f;
+      }
+    }
+    links.forEach(function (l) {
+      var a = nodes[l.source], b = nodes[l.target];
+      var dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      var k = 0.02 * (1 + Math.min(l.weight || 1, 4) * 0.4), f = (d - 96) * k;
+      var ux = dx / d, uy = dy / d;
+      a.vx += ux * f; a.vy += uy * f; b.vx -= ux * f; b.vy -= uy * f;
+    });
+    for (i = 0; i < N; i++) {
+      var n = nodes[i];
+      n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
+      if (i === drag) { n.vx = 0; n.vy = 0; continue; }
+      n.vx *= 0.86; n.vy *= 0.86;
+      n.x += n.vx * alpha; n.y += n.vy * alpha;
+      n.x = Math.max(n.r + 2, Math.min(W - n.r - 2, n.x));
+      n.y = Math.max(n.r + 2, Math.min(H - n.r - 2, n.y));
+    }
+    if (alpha > 0.02) alpha *= 0.99;
+  }
+
+  function neighbours(i) {
+    var s = {};
+    links.forEach(function (l) {
+      if (l.source === i) s[l.target] = 1;
+      if (l.target === i) s[l.source] = 1;
+    });
+    return s;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    var nb = hover >= 0 ? neighbours(hover) : null;
+    links.forEach(function (l) {
+      var a = nodes[l.source], b = nodes[l.target];
+      var on = hover < 0 || l.source === hover || l.target === hover;
+      ctx.strokeStyle = on ? 'rgba(150,170,150,' + Math.min(0.16 + (l.weight || 1) * 0.16, 0.7) + ')'
+                           : 'rgba(130,130,130,0.05)';
+      ctx.lineWidth = on ? Math.min(1 + (l.weight || 1), 4) : 1;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    });
+    nodes.forEach(function (n, i) {
+      var dim = hover >= 0 && i !== hover && !(nb && nb[i]);
+      ctx.globalAlpha = dim ? 0.25 : 1;
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, 2 * Math.PI);
+      ctx.fillStyle = 'hsl(' + n.hue + ',45%,' + (i === hover ? 62 : 48) + '%)';
+      ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.stroke();
+      ctx.fillStyle = i === hover ? '#fff' : '#cfcfcf';
+      ctx.font = (i === hover ? '600 ' : '') + Math.max(11, Math.min(15, 10 + n.r * 0.13)) + 'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText(n.name, n.x, n.y + n.r + 3);
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  function loop() {
+    tick(); draw();
+    if (alpha > 0.03 || drag >= 0 || hover >= 0) rafId = requestAnimationFrame(loop);
+    else rafId = null;
+  }
+  function kick(a) { if (a) alpha = Math.max(alpha, a); if (!rafId) rafId = requestAnimationFrame(loop); }
+  kick(1);
+
+  function pos(e) { var r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+  function hit(p) {
+    for (var i = N - 1; i >= 0; i--) {
+      var dx = p.x - nodes[i].x, dy = p.y - nodes[i].y, rr = nodes[i].r + 4;
+      if (dx * dx + dy * dy <= rr * rr) return i;
+    }
+    return -1;
+  }
+  canvas.addEventListener('pointermove', function (e) {
+    var p = pos(e);
+    if (drag >= 0) {
+      nodes[drag].x = p.x; nodes[drag].y = p.y; nodes[drag].vx = 0; nodes[drag].vy = 0;
+      if (Math.abs(p.x - downX) + Math.abs(p.y - downY) > 4) dragMoved = true;
+      kick(0.3);
+    } else {
+      var h = hit(p);
+      if (h !== hover) { hover = h; kick(0); }
+      canvas.style.cursor = h >= 0 ? 'pointer' : 'grab';
+    }
+  });
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = pos(e), h = hit(p);
+    downX = p.x; downY = p.y; dragMoved = false;
+    if (h >= 0) {
+      drag = h; hover = h; canvas.classList.add('dragging');
+      try { canvas.setPointerCapture(e.pointerId); } catch (x) {}
+      kick(0.3);
+    }
+  });
+  function release() {
+    if (drag >= 0 && !dragMoved) {
+      var el = document.getElementById('topic-' + drag);
+      if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
+    }
+    drag = -1; canvas.classList.remove('dragging'); kick(0);
+  }
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', function () { drag = -1; canvas.classList.remove('dragging'); kick(0); });
+  canvas.addEventListener('pointerleave', function () { if (drag < 0 && hover >= 0) { hover = -1; kick(0); } });
+  window.addEventListener('resize', function () {
+    var ox = W, oy = H; resize();
+    if (ox && oy) nodes.forEach(function (n) { n.x *= W / ox; n.y *= H / oy; });
+    kick(0.4);
+  });
+})();
+</script>"""
+
+_TOPICS_GENERATING = """
+    <div class="generating">
+      <div><span class="spinner"></span>Synthesising the conference's key topics…</div>
+      <span class="timer" id="gen-timer">__ELAPSED__s</span>
+      <div class="sub">alan is reading every talk summary · this page refreshes automatically</div>
+    </div>
+    <script>
+    (function () {
+      var el = document.getElementById('gen-timer'), t = __ELAPSED__;
+      var iv = setInterval(function () { t += 0.1; el.textContent = t.toFixed(1) + 's'; }, 100);
+      function poll() {
+        fetch('/topics.json', { cache: 'no-store' }).then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (d.status === 'ready') { clearInterval(iv); location.reload(); return; }
+            if (typeof d.elapsed === 'number') t = d.elapsed;
+            setTimeout(poll, 1500);
+          }).catch(function () { setTimeout(poll, 2500); });
+      }
+      setTimeout(poll, 1500);
+    })();
+    </script>"""
+
+_TOPICS_REFRESH_POLL = """
+<script>
+(function () {
+  function poll() {
+    fetch('/topics.json', { cache: 'no-store' }).then(function (r) { return r.json(); })
+      .then(function (d) { if (d.status === 'ready') location.reload(); else setTimeout(poll, 2500); })
+      .catch(function () { setTimeout(poll, 4000); });
+  }
+  setTimeout(poll, 2500);
+})();
+</script>"""
+
+
+def _render_topic_graph(data) -> str:
+    topics = data.get("topics", [])
+    if len(topics) < 2:
+        return ""
+    nodes = [{"name": tp.get("name", ""), "count": tp.get("count", 0)} for tp in topics]
+    payload = json.dumps({"nodes": nodes, "links": data.get("edges", [])}).replace("</", "<\\/")
+    return ('<div id="topic-graph-wrap"><canvas id="topic-graph"></canvas>'
+            '<div class="graph-hint">drag to explore · click a topic</div></div>'
+            f'<script id="graph-data" type="application/json">{payload}</script>'
+            + TOPIC_GRAPH_JS)
+
+
+def _render_topic_cards(data) -> str:
+    esc = html.escape
+    out = []
+    for i, tp in enumerate(data.get("topics", [])):
+        items = []
+        for r in tp.get("talks", []):
+            date, anchor = r.get("date") or "", esc(r["folder"])
+            href = (f'/summaries/{quote(date)}#{anchor}'
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else f'/summaries#{anchor}')
+            items.append(f'<li><a href="{href}">{esc(r["title"])}</a></li>')
+        desc = esc(tp.get("description") or "")
+        desc_html = f'<p class="tdesc">{desc}</p>' if desc else ""
+        kws = ", ".join(tp.get("keywords", []))
+        kw_html = f'<div class="tkw">{esc(kws)}</div>' if kws else ""
+        n = tp.get("count", len(items))
+        out.append(
+            f'<article class="tcard" id="topic-{i}">'
+            f'<h2>{esc(tp.get("name", ""))} <span class="n">{n} talk{"" if n == 1 else "s"}</span></h2>'
+            f'{desc_html}{kw_html}<ul class="ttalks">{"".join(items)}</ul></article>')
+    return "\n".join(out)
+
+
+def render_topics_page() -> str:
+    talks = _load_talks()
+    nav = '<a href="/summaries">summaries</a><a href="/">live</a>'
+    heading, title = "Key topics", "SBI4GALEV — Key topics"
+    if not talks:
+        return _page_shell(title, heading, nav, '<p class="empty">No talks saved yet.</p>')
+
+    data = _ensure_topics_summary(talks)
+    sig = _topics_signature(talks)
+    fresh = bool(data and data.get("signature") == sig)
+    has_content = bool(data and data.get("topics"))
+
+    if not has_content and not fresh:
+        with _topics_lock:
+            elapsed = max(0.0, time.time() - _topics_started_at) if _topics_inflight else 0.0
+        body = _TOPICS_GENERATING.replace("__ELAPSED__", f"{elapsed:.1f}")
+        return _page_shell(title, heading, nav, body)
+
+    esc = html.escape
+    topics = data.get("topics", [])
+    src_label = "alan" if data.get("source") == "llm" else "keyword aggregation"
+    parts = [f'{len(topics)} topic{"" if len(topics) == 1 else "s"} across '
+             f'{data.get("n_talks", len(talks))} talks', f'by {esc(src_label)}']
+    dur = data.get("duration_seconds")
+    if isinstance(dur, (int, float)):
+        parts.append(f'in <span class="timer">{dur:.1f}s</span>')
+    if data.get("generated_at"):
+        parts.append(esc(data["generated_at"]))
+    meta_txt = " · ".join(parts)
+    if not fresh:
+        meta_txt += ' · <span class="timer">updating…</span>'
+
+    intro = ('<p class="day-page-overview">The threads running through the conference so far — '
+             'each topic links to the talks that raised it; drag the graph to explore.</p>')
+    meta = f'<div class="topics-meta">{meta_txt}</div>'
+    inner = (_render_topic_graph(data) + _render_topic_cards(data)
+             if topics else '<p class="empty">No topics identified yet.</p>')
+    poll = "" if fresh else _TOPICS_REFRESH_POLL
+    return _page_shell(title, heading, nav, f'{intro}{meta}{inner}{poll}')
 
 
 def _push(event_type, data):
@@ -1448,6 +1958,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._html(render_day_page(date))
+        elif parsed.path == "/topics":
+            self._html(render_topics_page())
+        elif parsed.path == "/topics.json":
+            talks = _load_talks()
+            _ensure_topics_summary(talks)
+            self._json(200, _topics_status(talks))
         elif parsed.path.startswith("/talks/"):
             target = _safe_talk_path(unquote(parsed.path[len("/talks/"):]))
             if target is None:
