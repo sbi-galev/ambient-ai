@@ -783,9 +783,14 @@ def _parse_summary_json(raw: str, label: str) -> dict:
 def _summary_markdown(d: dict) -> str:
     lines = [f"# {d['title']}", ""]
     if d.get("speaker"):
-        lines += [f"**Speaker:** {d['speaker']}", ""]
+        who = d["speaker"]
+        if d.get("affiliation"):
+            who += f" — {d['affiliation']}"
+        lines += [f"**Speaker:** {who}", ""]
     if d.get("abstract"):
         lines += [d["abstract"], ""]
+    if d.get("official_abstract"):
+        lines += ["## Abstract (conference schedule)", "", d["official_abstract"], ""]
     if d.get("key_points"):
         lines += ["## Key points", ""] + [f"- {p}" for p in d["key_points"]] + [""]
     if d.get("topics"):
@@ -794,12 +799,41 @@ def _summary_markdown(d: dict) -> str:
     return "\n".join(lines)
 
 
+def _load_official_abstract(talk_dir: Path) -> dict | None:
+    """Look up the scraped conference-schedule abstract for this talk, if any.
+
+    Source of truth is the recut-surviving sidecar SAVE_DIR/official_abstracts.json,
+    a {folder_name: {speaker, affiliation, title, time, abstract}} map."""
+    f = SAVE_DIR / "official_abstracts.json"
+    if not f.exists():
+        return None
+    try:
+        entry = json.loads(f.read_text()).get(talk_dir.name)
+    except Exception:
+        return None
+    return entry if isinstance(entry, dict) and entry.get("abstract") else None
+
+
 def _generate_summary(talk_dir: Path, label: str) -> dict:
     tf = talk_dir / "transcript.txt"
     transcript = tf.read_text().strip() if tf.exists() else ""
     slides, total = _sample_slides(talk_dir / "slides", SUMMARY_MAX_SLIDES)
+    official = _load_official_abstract(talk_dir)
 
     header = f"Operator label for this talk: {label}\n\n" if label else ""
+    if official:
+        who = official.get("speaker", "")
+        if official.get("affiliation"):
+            who = f"{who} ({official['affiliation']})" if who else official["affiliation"]
+        header += (
+            "Official abstract for this talk, from the conference schedule. It is "
+            "authoritative for the title, speaker name and technical terms (use it to "
+            "correct ASR garbling), and for framing — but summarise what the talk "
+            "ACTUALLY covered from the transcript and slides; do not copy it verbatim "
+            "or describe content the talk did not deliver.\n"
+            f"Title: {official.get('title', '')}\n"
+            f"Speaker: {who}\n"
+            f"{official['abstract']}\n\n")
     header += (f"Slides: {total} total, {len(slides)} sampled below in order.\n\n"
                if total else "No slides were captured.\n\n")
     user = [{"type": "text",
@@ -812,6 +846,15 @@ def _generate_summary(talk_dir: Path, label: str) -> dict:
     raw = _llm_chat([{"role": "system", "content": SUMMARY_SYSTEM},
                      {"role": "user", "content": user}])
     data = _parse_summary_json(raw, label)
+    if official:
+        # Prefer the authoritative title/speaker over the ASR-derived guesses.
+        if official.get("title"):
+            data["title"] = official["title"]
+        if official.get("speaker"):
+            data["speaker"] = official["speaker"]
+        if official.get("affiliation"):
+            data["affiliation"] = official["affiliation"]
+        data["official_abstract"] = official["abstract"]
     data["generated_at"] = datetime.now().isoformat(timespec="seconds")
     data["model"] = LLM_MODEL
     data["n_slides"] = total
@@ -1434,6 +1477,10 @@ SUMMARIES_CSS = """
     .when { color:#555; font-size:0.7em; letter-spacing:1px; margin-bottom:0.9em; }
     .speaker { color:#9a9; font-size:0.85em; margin-bottom:0.6em; }
     .abstract { color:#bbb; line-height:1.65; margin-bottom:0.8em; }
+    .official-abstract { margin:0 0 0.8em 0; }
+    .official-abstract > summary { color:#7fa7d6; cursor:pointer; font-size:0.85em;
+        text-transform:uppercase; letter-spacing:0.04em; }
+    .official-abstract > p { color:#9a9a9a; line-height:1.65; margin:0.5em 0 0; }
     .card ul { margin:0 0 0.8em 1.1em; color:#9a9a9a; line-height:1.6; }
     .topics { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.8em; }
     .topics span { font-size:0.65em; letter-spacing:1px; color:#777; border:1px solid #262626;
@@ -1525,14 +1572,20 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
         inner = '<p class="pending">Summary unavailable.</p>'
     elif summary:
         speaker = esc(summary.get("speaker") or "")
+        if speaker and summary.get("affiliation"):
+            speaker += f" — {esc(summary['affiliation'])}"
         sp = f'<div class="speaker">{speaker}</div>' if speaker else ""
         abstract = esc(summary.get("abstract") or "")
+        official = esc(summary.get("official_abstract") or "")
+        official_html = (f"<details class='official-abstract'><summary>Abstract "
+                         f"(conference schedule)</summary><p>{official}</p></details>"
+                         if official else "")
         pts = "".join(f"<li>{esc(p)}</li>" for p in summary.get("key_points", []))
         pts_html = f"<ul>{pts}</ul>" if pts else ""
         tps = summary.get("topics", [])
         tps_html = ("<div class='topics'>" +
                     "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
-        inner = f"{sp}<p class='abstract'>{abstract}</p>{pts_html}{tps_html}"
+        inner = f"{sp}<p class='abstract'>{abstract}</p>{official_html}{pts_html}{tps_html}"
     else:
         inner = '<p class="pending">Summary generating…</p>'
     related_html = _render_related_html(_related_talks(t, all_talks))

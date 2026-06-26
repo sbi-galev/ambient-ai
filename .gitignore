@@ -7,3 +7,10 @@ day_summaries/
 topic_summaries/
 votes/
 .claude/settings.local.json
+
+# LaTeX build intermediates (from whitepaper.py --pdf)
+*.aux
+*.fls
+*.fdb_latexmk
+*.out
+*.toc
