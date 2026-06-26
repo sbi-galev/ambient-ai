@@ -8,9 +8,17 @@ topic_summaries/
 votes/
 .claude/settings.local.json
 
-# LaTeX build intermediates (from whitepaper.py --pdf)
+# LaTeX build intermediates (from whitepaper.py / ambient_ai_whitepaper.py --pdf)
 *.aux
 *.fls
 *.fdb_latexmk
 *.out
 *.toc
+
+# Generated white-paper outputs (reproducible from their .py generators).
+# Conference summary (root, written locally by alan):
+/whitepaper.tex
+/whitepaper.pdf
+# Ambient AI white paper (whitepaper/ folder, written by Claude):
+/whitepaper/ambient_ai_whitepaper.tex
+/whitepaper/ambient_ai_whitepaper.pdf
