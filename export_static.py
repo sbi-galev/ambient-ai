@@ -48,6 +48,67 @@ def _warn(msg):
     print(f"  ! {msg}", file=sys.stderr, flush=True)
 
 
+# ── Permissions allowlist (fail-closed) ──────────────────────────────────────
+
+ALLOWLIST_FILE = Path(__file__).parent / "public_talks.txt"
+
+
+def load_allowlist(path: Path = ALLOWLIST_FILE):
+    """Read the approved-talk folder names from public_talks.txt.
+
+    Returns a set of folder names, or None if the file is absent (caller decides
+    what that means). Blank lines and # comments are ignored; an inline '#'
+    trailing a folder name is stripped too."""
+    if not path.exists():
+        return None
+    names = set()
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            names.add(line)
+    return names
+
+
+def apply_allowlist(verbose):
+    """Wrap ts._load_talks so EVERY consumer (render functions, cache
+    generation) only ever sees talks approved for public export. Fail-closed:
+    a missing allowlist exports nothing."""
+    allowed = load_allowlist()
+    if allowed is None:
+        raise SystemExit(
+            f"No allowlist at {ALLOWLIST_FILE.name} — refusing to export (fail-closed). "
+            f"Create it with one approved folder name per line.")
+    if not allowed:
+        raise SystemExit(
+            f"{ALLOWLIST_FILE.name} lists no approved talks — nothing to export (fail-closed).")
+
+    _orig_load = ts._load_talks
+
+    def _ok(folder):
+        # Match an allowlist entry against the full folder name OR its readable
+        # slug (the part after the YYYY-MM-DD_HH-MM-SS_ timestamp prefix).
+        slug = re.sub(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_", "", folder)
+        return folder in allowed or slug in allowed
+
+    def _filtered():
+        talks = _orig_load()
+        kept = [t for t in talks if _ok(t["folder"])]
+        if verbose:
+            print(f"  allowlist: keeping {len(kept)}/{len(talks)} talks; "
+                  f"excluding {len(talks) - len(kept)}", flush=True)
+        matched = set()
+        for t in talks:
+            slug = re.sub(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_", "", t["folder"])
+            matched |= ({t["folder"], slug} & allowed)
+        missing = allowed - matched
+        if missing:
+            _warn(f"allowlist names {len(missing)} entr(y/ies) with no talk on disk: "
+                  f"{', '.join(sorted(missing))}")
+        return kept
+
+    ts._load_talks = _filtered
+
+
 # ── Cache freshness (run before rendering, so pages render fully not "pending") ─
 
 def ensure_caches(talks, use_llm, strict, verbose):
@@ -212,9 +273,10 @@ def main():
     args = ap.parse_args()
 
     out = Path(args.out)
+    apply_allowlist(args.verbose)   # fail-closed: only public_talks.txt talks
     talks = ts._load_talks()
     if not talks:
-        print("No talks found — nothing to export.")
+        print("No approved talks found (check public_talks.txt) — nothing to export.")
         return
 
     use_llm = (not args.no_llm) and ts.SUMMARIES_ENABLED
