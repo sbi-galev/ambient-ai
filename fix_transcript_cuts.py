@@ -27,6 +27,23 @@ has three subcommands:
             server's exact format; folders are re-locked read-only. Originals are
             backed up under transcripts/.backups/ first.
 
+The boundary re-cut above moves slides only as a side effect of moving the text
+they're interleaved with (the cut is by session position, decided from transcript
+TEXT). Slides shown during the speaker hand-over — the previous slide still on the
+projector, the next title slide shown early during setup, screen-share junk — are
+placed by capture time alone and routinely land in the wrong folder. Two more
+subcommands fix slide ownership directly, using each slide's timestamp AND its
+visible content:
+
+  slides-propose  For every adjacent pair, look at slides whose timestamp falls
+            near the A->B boundary and ask the LOCAL multimodal LLM which talk each
+            one belongs to (matching the slide's title/author against each side) —
+            or whether it's transition junk. Emits a reviewable slide-reassign plan.
+
+  slides-apply    Move each slide to its true talk (re-inserted in timestamp order
+            and renumbered) or, for junk, into slides/.culled/. Same backup +
+            rebuild + re-lock + verify engine as `apply`.
+
 Typical workflow (all on-box):
 
     python3 fix_transcript_cuts.py analyze
@@ -34,6 +51,10 @@ Typical workflow (all on-box):
     # review /tmp/plan.json, then:
     python3 fix_transcript_cuts.py apply /tmp/plan.json --dry-run
     python3 fix_transcript_cuts.py apply /tmp/plan.json
+    # then fix slide ownership across the same boundaries:
+    python3 fix_transcript_cuts.py slides-propose --out /tmp/slides.json
+    python3 fix_transcript_cuts.py slides-apply /tmp/slides.json --dry-run
+    python3 fix_transcript_cuts.py slides-apply /tmp/slides.json
     python3 backfill_summaries.py --force <changed-folder> [...]   # refresh summaries
 
 `propose` only handles leakage between ADJACENT talks (the common case). Splitting
@@ -67,6 +88,7 @@ Rules `apply` enforces:
     may safely be both a source and a destination.
 """
 import argparse
+import base64
 import html
 import json
 import os
@@ -492,6 +514,223 @@ def _bin_dirs(base=ROOT):
             if os.path.exists(os.path.join(b, n, "metadata.json"))]
 
 
+# ── slides-propose / slides-apply: fix slide ownership by timestamp + content ──
+
+def _ts_to_seconds(t):
+    try:
+        h, m, s = (int(p) for p in str(t).split(":"))
+        return h * 3600 + m * 60 + s
+    except (ValueError, AttributeError):
+        return None
+
+
+def _slug(name):
+    return re.sub(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_", "", os.path.basename(name))
+
+
+def _talk_identity(d):
+    """A short 'Speaker — Title' string for a talk dir, for the slide classifier.
+    Prefers the summary's speaker/title, falls back to the operator label/slug."""
+    label = ""
+    try:
+        label = load_meta(d).get("label", "")
+    except Exception:
+        pass
+    speaker = title = ""
+    sp = os.path.join(d, "summary.json")
+    if os.path.exists(sp):
+        try:
+            sm = json.load(open(sp))
+            speaker, title = sm.get("speaker") or "", sm.get("title") or ""
+        except Exception:
+            pass
+    title = title or label or _slug(d)
+    return (f"{speaker} — {title}" if speaker else title).strip(" —")
+
+
+SLIDE_SYSTEM = (
+    "You decide which of two consecutive conference talks a captured slide image "
+    "belongs to. The screen capture ran continuously across the hand-over, so a "
+    "frame near the boundary may be the PREVIOUS talk's last slide still on the "
+    "projector, the NEXT talk's title slide shown early during setup, or pure "
+    "transition junk (desktop, screen-share dialog, presentation-software editor, "
+    "video-call window, blank frame). Judge from the slide's visible content — its "
+    "title, author/affiliation, topic — matched against the speaker and title of "
+    "talk A or talk B. Respond with ONLY a JSON object."
+)
+
+
+def _classify_slide(id_a, id_b, ts_str, b64, timeout):
+    """Return (verdict, reason) with verdict in {A, B, N, ?}; N = junk, ? = unsure."""
+    content = [
+        {"type": "text",
+         "text": (f'Talk A = "{id_a}"\nTalk B = "{id_b}"\n'
+                  f"This frame was captured at {ts_str}, around the A->B hand-over. "
+                  "Which talk does it belong to?\n"
+                  'Reply ONLY with JSON: {"talk":"A"|"B"|"none","reason":"<short>"}  '
+                  '("none" = transition junk / not a real content slide).')},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]
+    raw = ts._llm_chat([{"role": "system", "content": SLIDE_SYSTEM},
+                        {"role": "user", "content": content}],
+                       max_tokens=200, temperature=0.0, timeout=timeout)
+    try:
+        obj = _parse_json(raw)
+        t = str(obj.get("talk", "")).strip().upper()[:1]
+        return (t if t in ("A", "B", "N") else "?"), str(obj.get("reason", ""))[:160]
+    except Exception as e:
+        return "?", f"unparseable ({e})"
+
+
+def slides_propose(margin=90, timeout=120, out=None, backup_label="reslide"):
+    dirs = talk_dirs()
+    moves = []
+    for a, b in zip(dirs, dirs[1:]):
+        sa, sb = load_session(a), load_session(b)
+        a_text = [x for x in sa if x["type"] == "text"]
+        b_text = [x for x in sb if x["type"] == "text"]
+        if not a_text or not b_text:
+            continue
+        a_end = _ts_to_seconds(a_text[-1].get("ts", ""))
+        b_start = _ts_to_seconds(b_text[0].get("ts", ""))
+        if a_end is None or b_start is None:
+            continue
+        id_a, id_b = _talk_identity(a), _talk_identity(b)
+        # Boundary candidates: A's slides from `margin`s before its last word on,
+        # and B's slides up to `margin`s after its first word — i.e. everything
+        # that could plausibly sit on the wrong side of the hand-over.
+        cands = []  # (folder, item, current_owner)
+        for x in sa:
+            s = _ts_to_seconds(x.get("ts", "")) if x["type"] == "slide" else None
+            if s is not None and s >= a_end - margin:
+                cands.append((a, x, "A"))
+        for x in sb:
+            s = _ts_to_seconds(x.get("ts", "")) if x["type"] == "slide" else None
+            if s is not None and s <= b_start + margin:
+                cands.append((b, x, "B"))
+        if not cands:
+            continue
+        print(f"  {os.path.basename(a)} -> {os.path.basename(b)}: "
+              f"{len(cands)} boundary slide(s)", flush=True)
+        for folder, it, cur in cands:
+            fp = os.path.join(folder, it["file"])
+            if not os.path.exists(fp):
+                continue
+            with open(fp, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode()
+            verdict, reason = _classify_slide(id_a, id_b, it.get("ts", ""), b64, timeout)
+            if verdict == "?":
+                continue
+            if verdict == "N":
+                moves.append({"src": os.path.basename(folder), "file": it["file"],
+                              "ts": it.get("ts", ""), "dest": "CULL", "reason": reason})
+                print(f"    CULL {it['file']} ({it.get('ts','')}): {reason}")
+            elif verdict == "A" and cur == "B":
+                moves.append({"src": os.path.basename(b), "file": it["file"],
+                              "ts": it.get("ts", ""), "dest": os.path.basename(a),
+                              "reason": reason})
+                print(f"    {it['file']} B->A ({it.get('ts','')}): {reason}")
+            elif verdict == "B" and cur == "A":
+                moves.append({"src": os.path.basename(a), "file": it["file"],
+                              "ts": it.get("ts", ""), "dest": os.path.basename(b),
+                              "reason": reason})
+                print(f"    {it['file']} A->B ({it.get('ts','')}): {reason}")
+            # verdict matches current owner -> leave in place
+    plan = {"type": "slide-reassign", "backup_label": backup_label, "moves": moves}
+    text = json.dumps(plan, indent=2)
+    if out:
+        open(out, "w").write(text)
+        print(f"\nplan -> {out}  ({len(moves)} move/cull op(s))")
+        print("review it, then:  python3 fix_transcript_cuts.py slides-apply " + out)
+    else:
+        print(text)
+
+
+def slides_apply(plan_path, date=None, dry_run=False):
+    plan = json.load(open(plan_path))
+    moves = plan.get("moves", [])
+    if not moves:
+        print("plan lists no slide moves.")
+        return
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    bk_root = os.path.join(ROOT, ".backups", f"{date}_{plan.get('backup_label', 'reslide')}")
+
+    srcs = {m["src"] for m in moves}
+    dests = {m["dest"] for m in moves if m["dest"] != "CULL"}
+    affected = srcs | dests
+
+    print(f"backup -> {bk_root}")
+    if not dry_run:
+        os.makedirs(bk_root, exist_ok=True)
+    for name in sorted(affected):
+        src = os.path.join(ROOT, name)
+        if not os.path.isdir(src):
+            continue
+        dst = os.path.join(bk_root, name)
+        if dry_run:
+            print(f"  would back up {name}")
+        elif not os.path.exists(dst):
+            shutil.copytree(src, dst)
+            _unlock(dst)
+
+    def bdir(name):  # read sources from the immutable backup
+        p = os.path.join(bk_root, name)
+        return p if os.path.isdir(p) else os.path.join(ROOT, name)
+
+    removed, incoming, culls = {}, {}, {}
+    for m in moves:
+        removed.setdefault(m["src"], set()).add(m["file"])
+        if m["dest"] == "CULL":
+            culls.setdefault(m["src"], []).append(m["file"])
+        else:
+            incoming.setdefault(m["dest"], []).append((m["file"], m["src"]))
+
+    # 1. Rebuild every affected folder: drop departed/culled slides, splice in the
+    #    arrivals, re-sort the whole session by timestamp, renumber via _build.
+    for folder in sorted(affected):
+        bd = bdir(folder)
+        sess = json.load(open(os.path.join(bd, "session.json")))
+        meta = json.load(open(os.path.join(bd, "metadata.json")))
+        rem = removed.get(folder, set())
+        items = [(it, bd) for it in sess
+                 if not (it["type"] == "slide" and it["file"] in rem)]
+        for fn, srcname in incoming.get(folder, []):
+            ssess = json.load(open(os.path.join(bdir(srcname), "session.json")))
+            found = next((x for x in ssess
+                          if x["type"] == "slide" and x["file"] == fn), None)
+            if found:
+                items.append((found, bdir(srcname)))
+        items.sort(key=lambda pair: _ts_to_seconds(pair[0].get("ts", "")) or 0)
+        nt = sum(1 for it, _ in items if it["type"] == "text")
+        ns = sum(1 for it, _ in items if it["type"] == "slide")
+        if dry_run:
+            print(f"  would rebuild {folder}: {nt} text, {ns} slides")
+            continue
+        _build(os.path.join(ROOT, folder), items, meta.get("label", ""),
+               meta.get("saved_at", ""))
+        print(f"  rebuilt {folder}: {nt} text, {ns} slides")
+
+    # 2. Junk slides -> their source folder's slides/.culled/ (reversible).
+    for folder, files in culls.items():
+        if dry_run:
+            print(f"  would cull {len(files)} from {folder} -> slides/.culled/")
+            continue
+        d, bd = os.path.join(ROOT, folder), bdir(folder)
+        _unlock(d)
+        try:
+            cdir = os.path.join(d, "slides", ".culled")
+            os.makedirs(cdir, exist_ok=True)
+            for fn in files:
+                src = os.path.join(bd, fn)
+                if os.path.exists(src):
+                    shutil.copyfile(src, os.path.join(cdir, os.path.basename(fn)))
+        finally:
+            _lock(d)
+        print(f"  culled {len(files)} from {folder} -> slides/.culled/")
+
+    if not dry_run:
+        _verify()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -508,6 +747,17 @@ def main():
     pp.add_argument("plan")
     pp.add_argument("--dry-run", action="store_true")
     pp.add_argument("--date", help="override backup date stamp (YYYY-MM-DD)")
+    sp = sub.add_parser("slides-propose",
+                        help="LLM reassigns/culls boundary slides by content + timestamp")
+    sp.add_argument("--out", help="write the slide-reassign plan here (default: stdout)")
+    sp.add_argument("--margin", type=int, default=90,
+                    help="seconds either side of a boundary to examine (default 90)")
+    sp.add_argument("--timeout", type=int, default=120, help="per-LLM-call timeout (s)")
+    sp.add_argument("--backup-label", default="reslide")
+    sx = sub.add_parser("slides-apply", help="execute a slide-reassign plan (JSON)")
+    sx.add_argument("plan")
+    sx.add_argument("--dry-run", action="store_true")
+    sx.add_argument("--date", help="override backup date stamp (YYYY-MM-DD)")
     args = ap.parse_args()
     if args.cmd == "analyze":
         analyze(context=args.context)
@@ -516,6 +766,11 @@ def main():
                 backup_label=args.backup_label)
     elif args.cmd == "apply":
         apply(args.plan, date=args.date, dry_run=args.dry_run)
+    elif args.cmd == "slides-propose":
+        slides_propose(margin=args.margin, timeout=args.timeout, out=args.out,
+                       backup_label=args.backup_label)
+    elif args.cmd == "slides-apply":
+        slides_apply(args.plan, date=args.date, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
