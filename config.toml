@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ambient-AI conference toolkit — site configuration.
+#
+# Edit this file for your event. Every value can ALSO be overridden at runtime by
+# an environment variable (precedence: env var > this file > built-in default),
+# so existing deployment scripts keep working unchanged. The shipped values are
+# the SBI4GALEV 2026 reference deployment — change them for yours.
+#
+# Read by config.py, which both the GPU server (transcript_server.py) and the
+# laptop capture client (live_transcribe.py) import.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[conference]
+# Short tag shown in page titles/headings and used in the LLM prompts.
+short_name = "SBI4GALEV"                                      # env: CONF_SHORT
+# Full descriptive name, used in prompts and the white papers.
+full_name  = "Simulation-Based Inference for Galaxy Evolution"  # env: CONF_FULL
+year       = "2026"                                           # env: CONF_YEAR
+# The persona the local model writes as in summaries/white papers, and the
+# byline on generated pages. (The reference deployment named it "alan".)
+assistant_name = "alan"                                       # env: ASSISTANT_NAME
+
+[server]
+host = "0.0.0.0"          # interface to bind; 0.0.0.0 = all (LAN).   env: TRANSCRIPT_HOST
+port = 7103              #                                            env: TRANSCRIPT_PORT
+# Shared secret guarding /admin, /save, /transcribe, /image, /push.
+# CHANGE THIS for a real event.
+token = "sbi4galev"      #                                            env: TRANSCRIPT_TOKEN
+# How laptop clients and attendees reach the server: the capture client POSTs
+# here and attendees open it in a browser. Set to the server's LAN address.
+public_url = "http://172.24.17.90:7103"  #                           env: TRANSCRIPT_URL
+
+[stt]
+# NeMo ASR model loaded on startup (downloaded & cached on first run).
+model = "stt_en_fastconformer_transducer_xxlarge"  #                 env: STT_MODEL
+device = "cuda:0"        # torch device, e.g. "cuda:0" or "cpu".      env: STT_DEVICE
+sample_rate = 16000      #                                            env: STT_SAMPLE_RATE
+
+[llm]
+# OpenAI-compatible chat-completions endpoint of the local multimodal model.
+url = "http://127.0.0.1:30000/v1/chat/completions"  #                env: ALAN_LLM_URL
+model = "google/gemma-4-31b-it"  #                                   env: ALAN_LLM_MODEL
+enabled = true           # set false to save talks without AI summaries. env: SUMMARIES
+max_slides = 8           # slides (evenly sampled) sent per summary.  env: SUMMARY_MAX_SLIDES
+
+[tuning]
+# Hold back the last N seconds at save time so the next speaker's opening bundles
+# with the next talk, not this one. 0 disables.
+save_offset_seconds = 30   #                                         env: SAVE_OFFSET_SECONDS
+# Snapshot the live transcript to disk every N seconds for crash recovery. 0 off.
+live_flush_seconds = 10    #                                         env: LIVE_FLUSH_SECONDS
+topics_max = 14            # cap on synthesised key topics.          env: TOPICS_MAX

@@ -1,6 +1,6 @@
 """SBI4GALEV live transcript server.
 
-Loads stt_en_fastconformer_transducer_xxlarge once on startup, then serves:
+Loads the configured NeMo STT model once on startup, then serves:
   POST /transcribe  — audio file → NeMo inference → pushes text to SSE
   POST /image       — JPEG screenshot → pushes to SSE if slide changed
   POST /push        — raw text → pushes to SSE (fallback/testing)
@@ -11,12 +11,12 @@ Loads stt_en_fastconformer_transducer_xxlarge once on startup, then serves:
   GET  /stream      — SSE stream for browsers
   GET  /            — public, view-only transcript viewer
   GET  /admin?token=… — operator viewer with the End-talk/Save control
-  GET  /summaries   — AI summary of every saved talk (alan / local gemma)
+  GET  /summaries   — AI summary of every saved talk (local LLM)
   GET  /talks/…     — read-only static access to saved slides/summaries; the
                       full transcript files require the admin token (?token=…)
 
 After a talk is saved, a background worker sends its transcript + slides to the
-local model (alan's engine: gemma-4-31b via SGLang) and writes summary.json /
+local model (an OpenAI-compatible multimodal LLM) and writes summary.json /
 summary.md into the talk folder, then finalises the folder read-only.
 
 There is deliberately no endpoint that deletes or mutates saved talks: once a
@@ -53,6 +53,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import config
+
 SAVE_DIR = Path(__file__).parent / "transcripts"
 SAVE_DIR.mkdir(exist_ok=True)
 # Talk folders are read-only once finalised, so audience votes on speaker
@@ -71,20 +73,26 @@ DAYS_DIR.mkdir(exist_ok=True)
 TOPICS_DIR = Path(__file__).parent / "topic_summaries"
 TOPICS_DIR.mkdir(exist_ok=True)
 TOPICS_PATH = TOPICS_DIR / "topics.json"
-TOPICS_MAX = int(os.environ.get("TOPICS_MAX", "14"))
+TOPICS_MAX = config.TOPICS_MAX
 
-PORT = int(os.environ.get("TRANSCRIPT_PORT", "7103"))
-TOKEN = os.environ.get("TRANSCRIPT_TOKEN", "sbi4galev")
-DEVICE = os.environ.get("STT_DEVICE", "cuda:0")
-MODEL_NAME = "stt_en_fastconformer_transducer_xxlarge"
-SAMPLE_RATE = 16000
+# Conference identity & assistant persona — edit in config.toml.
+CONF_SHORT = config.CONF_SHORT
+CONF_FULL = config.CONF_FULL
+ASSISTANT_NAME = config.ASSISTANT_NAME
+
+HOST = config.HOST
+PORT = config.PORT
+TOKEN = config.TOKEN
+DEVICE = config.STT_DEVICE
+MODEL_NAME = config.STT_MODEL
+SAMPLE_RATE = config.SAMPLE_RATE
 
 # "End talk & Save" is invariably clicked a beat late — by the time the chair has
 # thanked the speaker and the next one starts, the last few seconds of audio (the
 # next speaker's opening) have already landed in this talk's history. We hold back
 # the most recent SAVE_OFFSET_SECONDS of chunks at save time, leaving them in the
 # live history so they bundle with the *next* talk instead. Set to 0 to disable.
-SAVE_OFFSET_SECONDS = int(os.environ.get("SAVE_OFFSET_SECONDS", "30"))
+SAVE_OFFSET_SECONDS = config.SAVE_OFFSET_SECONDS
 
 # Crash safety: the live transcript buffer lives in memory and is only written to
 # disk when a talk is explicitly saved. To survive a crash/restart mid-talk we
@@ -92,14 +100,14 @@ SAVE_OFFSET_SECONDS = int(os.environ.get("SAVE_OFFSET_SECONDS", "30"))
 # reload it on startup, so the in-progress (unsaved) talk resumes instead of being
 # lost. Set LIVE_FLUSH_SECONDS=0 to disable.
 LIVE_STATE_PATH = SAVE_DIR / ".live.json"
-LIVE_FLUSH_SECONDS = int(os.environ.get("LIVE_FLUSH_SECONDS", "10"))
+LIVE_FLUSH_SECONDS = config.LIVE_FLUSH_SECONDS
 
-# Local summarisation model — alan's engine: SGLang serving gemma-4-31b-it on an
-# OpenAI-compatible endpoint. Override via env to repoint at another provider.
-LLM_URL = os.environ.get("ALAN_LLM_URL", "http://127.0.0.1:30000/v1/chat/completions")
-LLM_MODEL = os.environ.get("ALAN_LLM_MODEL", "google/gemma-4-31b-it")
-SUMMARIES_ENABLED = os.environ.get("SUMMARIES", "1") != "0"
-SUMMARY_MAX_SLIDES = int(os.environ.get("SUMMARY_MAX_SLIDES", "8"))
+# Local summarisation model — an OpenAI-compatible, multimodal chat endpoint
+# (the reference deployment used SGLang serving gemma-4-31b-it). See config.toml.
+LLM_URL = config.LLM_URL
+LLM_MODEL = config.LLM_MODEL
+SUMMARIES_ENABLED = config.SUMMARIES_ENABLED
+SUMMARY_MAX_SLIDES = config.SUMMARY_MAX_SLIDES
 
 _subscribers = []
 _lock = threading.Lock()
@@ -460,12 +468,14 @@ ADMIN_JS = """
 
 
 def render_page(admin: bool) -> str:
+    page = PAGE_TEMPLATE.replace("SBI4GALEV — Live Transcript",
+                                 f"{CONF_SHORT} — Live Transcript")
     if admin:
-        return (PAGE_TEMPLATE
+        return (page
                 .replace("/*ADMIN_CSS*/", ADMIN_CSS)
                 .replace("<!--ADMIN_HTML-->", ADMIN_HTML)
                 .replace("/*ADMIN_JS*/", ADMIN_JS.replace("__TOKEN__", json.dumps(TOKEN))))
-    return (PAGE_TEMPLATE
+    return (page
             .replace("/*ADMIN_CSS*/", "")
             .replace("<!--ADMIN_HTML-->", "")
             .replace("/*ADMIN_JS*/", ""))
@@ -704,7 +714,7 @@ def _save_session(label: str):
 # ── Summarisation (alan / local gemma) ───────────────────────────────────────
 
 SUMMARY_SYSTEM = (
-    "You are alan, summarising a recorded conference talk for a public archive. "
+    f"You are {ASSISTANT_NAME}, summarising a recorded conference talk for a public archive. "
     "You are given the talk's transcript (from automatic speech recognition — expect "
     "transcription errors and unreliable punctuation) and a sample of its slides, in order. "
     "Write a faithful, concise summary that helps someone who missed the talk understand what "
@@ -1075,9 +1085,9 @@ document.querySelectorAll('.questions').forEach(function (list) {
 # ── Per-day overviews ────────────────────────────────────────────────────────
 
 DAY_SYSTEM = (
-    "You are alan, writing a short editorial overview of a single day of a "
-    "research conference (SBI4GALEV — simulation-based inference for galaxy "
-    "evolution) for a public archive. You are given that day's talks in order, "
+    f"You are {ASSISTANT_NAME}, writing a short editorial overview of a single day of a "
+    f"research conference ({CONF_SHORT} — {CONF_FULL}) for a public "
+    "archive. You are given that day's talks in order, "
     "each with its title, speaker, abstract and key points (themselves AI "
     "summaries of automatic transcripts, so expect some noise). Write a faithful, "
     "concise overview of the day: what ground it covered, how the talks related, "
@@ -1211,9 +1221,9 @@ def _ensure_day_summary(date: str, day_label: str, day_talks: list):
 # topics that co-occur in a talk become linked nodes in the /topics graph.
 
 TOPICS_SYSTEM = (
-    "You are alan, distilling the key topics of a research conference (SBI4GALEV — "
-    "simulation-based inference for galaxy evolution) for a public archive. You are "
-    "given the list of talks so far and a vocabulary of topic keywords drawn from "
+    f"You are {ASSISTANT_NAME}, distilling the key topics of a research conference "
+    f"({CONF_SHORT} — {CONF_FULL}) for a public archive. "
+    "You are given the list of talks so far and a vocabulary of topic keywords drawn from "
     "their summaries (themselves AI summaries of automatic transcripts, so expect "
     "noise, duplicates and spelling variants). Cluster the keywords into the "
     "conference's main topics, merging synonyms and variants (e.g. 'amortised' and "
@@ -1617,7 +1627,7 @@ def render_day_page(date: str) -> str:
     match = next(((dt, label, dtalks) for dt, label, dtalks in grouped if dt == date), None)
     nav = '<a href="/summaries">← all days</a><a href="/topics">key topics</a><a href="/">live</a>'
     if match is None:
-        return _page_shell("SBI4GALEV — Day not found", "SBI4GALEV", nav,
+        return _page_shell(f"{CONF_SHORT} — Day not found", CONF_SHORT, nav,
                            '<p class="empty">No talks recorded for this day.</p>')
     _, day_label, day_talks = match
     day_summary = _ensure_day_summary(date, day_label, day_talks)
@@ -1626,7 +1636,7 @@ def render_day_page(date: str) -> str:
     # Cards in talk order for the day (oldest first → as the day unfolded).
     cards = "\n".join(_render_talk_card(t, talks) for t in day_talks)
     body = f'<div class="day-page-head">{overview}</div>{cards}'
-    return _page_shell(f"SBI4GALEV — {day_label}", heading, nav, body)
+    return _page_shell(f"{CONF_SHORT} — {day_label}", heading, nav, body)
 
 
 def render_summaries_page() -> str:
@@ -1637,7 +1647,7 @@ def render_summaries_page() -> str:
     esc = html.escape
     nav = '<a href="/topics">key topics</a><a href="/">← live</a>'
     if not grouped:
-        return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
+        return _page_shell(f"{CONF_SHORT} — Talk summaries", f"{CONF_SHORT} — Talks", nav,
                            '<p class="empty">No talks saved yet.</p>')
 
     blocks = []
@@ -1666,7 +1676,7 @@ def render_summaries_page() -> str:
             f'<a class="day-more" href="/summaries/{quote(date)}">View {day_label} in full →</a>'
             f'</section>')
 
-    return _page_shell("SBI4GALEV — Talk summaries", "SBI4GALEV — Talks", nav,
+    return _page_shell(f"{CONF_SHORT} — Talk summaries", f"{CONF_SHORT} — Talks", nav,
                        "\n".join(blocks))
 
 
@@ -1828,7 +1838,7 @@ _TOPICS_GENERATING = """
     <div class="generating">
       <div><span class="spinner"></span>Synthesising the conference's key topics…</div>
       <span class="timer" id="gen-timer">__ELAPSED__s</span>
-      <div class="sub">alan is reading every talk summary · this page refreshes automatically</div>
+      <div class="sub">__ASSISTANT__ is reading every talk summary · this page refreshes automatically</div>
     </div>
     <script>
     (function () {
@@ -1896,7 +1906,7 @@ def _render_topic_cards(data) -> str:
 def render_topics_page() -> str:
     talks = _load_talks()
     nav = '<a href="/summaries">summaries</a><a href="/">live</a>'
-    heading, title = "Key topics", "SBI4GALEV — Key topics"
+    heading, title = "Key topics", f"{CONF_SHORT} — Key topics"
     if not talks:
         return _page_shell(title, heading, nav, '<p class="empty">No talks saved yet.</p>')
 
@@ -1908,12 +1918,12 @@ def render_topics_page() -> str:
     if not has_content and not fresh:
         with _topics_lock:
             elapsed = max(0.0, time.time() - _topics_started_at) if _topics_inflight else 0.0
-        body = _TOPICS_GENERATING.replace("__ELAPSED__", f"{elapsed:.1f}")
+        body = _TOPICS_GENERATING.replace("__ELAPSED__", f"{elapsed:.1f}").replace("__ASSISTANT__", ASSISTANT_NAME)
         return _page_shell(title, heading, nav, body)
 
     esc = html.escape
     topics = data.get("topics", [])
-    src_label = "alan" if data.get("source") == "llm" else "keyword aggregation"
+    src_label = ASSISTANT_NAME if data.get("source") == "llm" else "keyword aggregation"
     parts = [f'{len(topics)} topic{"" if len(topics) == 1 else "s"} across '
              f'{data.get("n_talks", len(talks))} talks', f'by {esc(src_label)}']
     dur = data.get("duration_seconds")
@@ -2141,10 +2151,10 @@ def main():
     # autosave loop that keeps the live buffer crash-recoverable.
     _load_live_state()
     threading.Thread(target=_live_autosave_worker, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Transcript server live at http://0.0.0.0:{PORT}", flush=True)
-    print(f"  public viewer : http://0.0.0.0:{PORT}/", flush=True)
-    print(f"  operator page : http://0.0.0.0:{PORT}/admin?token={TOKEN}", flush=True)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"{CONF_SHORT} transcript server live at http://{HOST}:{PORT}", flush=True)
+    print(f"  public viewer : http://{HOST}:{PORT}/", flush=True)
+    print(f"  operator page : http://{HOST}:{PORT}/admin?token={TOKEN}", flush=True)
     server.serve_forever()
 
 

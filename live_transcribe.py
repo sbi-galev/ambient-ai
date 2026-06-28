@@ -23,12 +23,12 @@ import numpy as np
 import sounddevice as sd
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).parent / "sbi4galev"))
+import config
 from screen_capture import ScreenCapture
 
-SERVER = "http://172.24.17.90:7103"
-TOKEN = "sbi4galev"
-SAMPLE_RATE = 16000
+SERVER = config.PUBLIC_URL   # how this client reaches the server (config.toml [server].public_url)
+TOKEN = config.TOKEN
+SAMPLE_RATE = config.SAMPLE_RATE
 CHUNK_SECONDS = 8
 MIN_CHUNK_SECONDS = 2
 BLOCK_SIZE = int(SAMPLE_RATE * 0.1)  # 100ms blocks

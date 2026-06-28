@@ -1,16 +1,19 @@
-"""Test stt_en_fastconformer_transducer_xxlarge on a WAV chunk."""
+"""Smoke-test the configured STT model on a WAV chunk (config.toml [stt])."""
 import time, sys, wave, io
 import numpy as np
 
-MODEL = "stt_en_fastconformer_transducer_xxlarge"
+import config
+
+MODEL = config.STT_MODEL
+DEVICE = config.STT_DEVICE
 
 import nemo.collections.asr as nemo_asr
-print(f"Loading {MODEL}...", flush=True)
+print(f"Loading {MODEL} on {DEVICE}...", flush=True)
 t0 = time.time()
-model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL, map_location="cuda:0")
+model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL, map_location=DEVICE)
 print(f"Loaded in {time.time()-t0:.1f}s", flush=True)
 
-wav_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/turing_demo.wav"
+wav_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/stt_demo.wav"
 t1 = time.time()
 result = model.transcribe([wav_path], batch_size=1, verbose=False)
 elapsed = time.time() - t1

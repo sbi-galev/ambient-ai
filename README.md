@@ -1,142 +1,366 @@
-# SBI4GALEV Live Transcript
+# Ambient AI for Conferences
 
-Live transcription and AI tooling for the SBI4GALEV conference, hosted on the Turing GPU workstation.
+A self-hosted toolkit that turns a scientific meeting into a durable, searchable record. A single GPU machine listens to the room, transcribes the talks, and captures the projected slides into a context store. This is then used by a local or external LLM agent to produce per-talk summaries, suggest audience questions, provide per-day overviews, a conference-wide topic graph, a publishable static archive, and a multi-page summary white paper.
+
+With privacy in mind, the full stack can be run on local hardware. None of the context store is sent to an external service; the only network traffic is on your own LAN.
+
+> This repository was built for and deployed at **SBI4GALEV 2026**. It is now a general template: all site- and hardware-specific values live in
+> [`config.toml`](config.toml), which ships with the SBI4GALEV deployment's values as a worked example. **To run your own event, edit `config.toml`**.
+> You can optionally add extra features as required or update the design by working with your own favourite local or external LLM.
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Configuration (`config.toml`)](#configuration-configtoml)
+- [Running an event](#running-an-event)
+- [The context store (data model)](#the-context-store-data-model)
+- [AI features](#ai-features)
+- [Publishing a public archive](#publishing-a-public-archive)
+- [White papers](#white-papers)
+- [Maintenance scripts](#maintenance-scripts)
+- [Script reference](#script-reference)
+- [Privacy & security](#privacy--security)
+
+---
 
 ## What it does
 
-- Streams microphone audio to Turing's GPU for transcription using NeMo FastConformer (20x faster than real time)
-- Displays a live transcript on a locally hosted website accessible to anyone on the UDN network
-- Captures slide screenshots silently via PipeWire (no flash, no manual triggering) and displays them interleaved with the transcript
-- At the end of each talk the operator presses **Save** on a token-protected `/admin` page: the transcript and every captured slide are written together into a dedicated, read-only folder under `transcripts/`, then the live view resets for the next speaker
-- Each saved talk is then summarised by the local LLM (alan's engine — gemma-4-31b via SGLang) from the transcript **and** its slides; summaries are browsable at `/summaries`
-- Every summary also suggests three kind, considerate questions the audience can vote up/down, and links to up to three related earlier talks
+While a talk is in progress the laptop streams microphone (or shared-system) audio
+to the GPU, where NeMo FastConformer transcribes it at roughly 20× real time, and
+quietly grabs the projected slides through the PipeWire screen-capture portal.
+There is no flash and nothing to trigger by hand; a slide is only sent when the
+picture actually changes. The running transcript and its slides appear on a plain
+web page that anyone on the network can open, with no app and no login.
 
-## Architecture
+When a talk ends the operator presses **End talk & Save** on the token-protected
+`/admin` page. Everything captured so far is written into the context store as one
+read-only talk folder, and the live view resets for the next speaker.
+
+From there the LLM agent works over the context store. Each talk gets a summary
+drawn from both its transcript and its slides, three suggested audience questions
+that attendees can vote on, and links to related earlier talks (browsable at
+`/summaries`). Across talks the agent keeps per-day overviews and a
+conference-wide key-topics graph (`/topics`) up to date. Two further outputs build
+on the same store: `export_static.py` publishes a curated subset as a static
+`site/` for GitHub Pages, gated per speaker by a fail-closed permissions allowlist,
+and `whitepaper.py` writes a short LaTeX summary of the whole meeting, optionally
+compared against last year.
+
+## How it works
 
 ```
-Laptop mic ──────────────────────────────────────────┐
-                                                      ▼
-PipeWire screen → live_transcribe.py → POST audio/image → Turing (172.24.17.90:7103)
-                                                               ↓ NeMo STT
-                                                          SSE push
-                                                               ↓
-                                            Attendee phones/laptops ← GET /stream
+  Laptop (mic + screen)                         GPU server
+  ─────────────────────                         ──────────
+  microphone ─┐                          ┌─► NeMo STT ─┐
+              ├─ live_transcribe.py ─POST─┤             ├─► SSE ─► attendee browsers (GET /)
+  slides  ────┘   (audio + JPEG)         └─► slide store┘
+                                                │
+                          operator presses Save │
+                                                ▼
+                                  context store: transcripts/<talk>/  (read-only)
+                                                │
+                          local or external LLM agent (summaries, questions,
+                          day overviews, key-topics graph)
+                                                │
+                ┌───────────────────────────────┼───────────────────────────────┐
+                ▼                                ▼                                ▼
+        GET /summaries, /topics        export_static.py ─► site/          whitepaper.py
+        (live browsing)                ─► GitHub Pages                    ─► LaTeX / PDF
 ```
 
-## Laptop setup
+The capture client (laptop) and the server (GPU box) are separate machines that
+share this repository, and therefore the same `config.toml`. The context store
+lives on the server, which binds to the LAN and is never exposed to the internet;
+only the curated static archive is published.
 
-### System dependencies (apt)
+## Requirements
+
+### Server (the GPU box)
+
+- **Python 3.11+** (the config loader uses the standard-library `tomllib`).
+- **A CUDA GPU** for real-time STT. CPU works for testing — set
+  `[stt].device = "cpu"` — but is far slower.
+- **NeMo ASR** and its dependencies:
+  ```bash
+  pip install "nemo_toolkit[asr]"      # also pulls in torch/torchaudio
+  sudo apt install ffmpeg
+  ```
+  If NeMo is installed as a *system* package rather than via pip, add it to
+  `PYTHONPATH` when launching the server (see [Running an event](#running-an-event)).
+- **An OpenAI-compatible, multimodal chat endpoint** for the AI features. Run one
+  locally for full privacy — e.g. [SGLang](https://github.com/sgl-project/sglang)
+  or [vLLM](https://github.com/vllm-project/vllm) serving a vision-language model
+  (the reference deployment used `google/gemma-4-31b-it`) — or point it at an
+  external API. It is optional: set `[llm].enabled = false` and talks are still
+  saved, just without summaries.
+
+### Laptop (the capture client)
+
+- **System packages** (Debian/Ubuntu/GNOME-Wayland) for silent screen capture:
+  ```bash
+  sudo apt install \
+    python3-gi python3-dbus \
+    gstreamer1.0-pipewire gstreamer1.0-plugins-base \
+    gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+  ```
+- **Python packages:**
+  ```bash
+  pip install -r requirements.txt          # sounddevice, numpy, Pillow
+  ```
+
+Screen capture needs a desktop that supports the XDG ScreenCast portal (GNOME
+Wayland). If yours does not, the client prints a warning and carries on —
+transcription still works, slides just are not sent.
+
+## Configuration (`config.toml`)
+
+[`config.toml`](config.toml) is the **single place** to configure an event. Both
+the server and the laptop client read it via [`config.py`](config.py). Every
+value can also be overridden at runtime by an environment variable, so existing
+deployment scripts keep working. Resolution order, first match wins:
+
+> **environment variable → `config.toml` → built-in default**
+
+| Section | Key | What it is | Env override |
+|---|---|---|---|
+| `[conference]` | `short_name` | Tag in page titles & prompts (e.g. `SBI4GALEV`) | `CONF_SHORT` |
+| | `full_name` | Full descriptive name | `CONF_FULL` |
+| | `year` | Used in the white-paper title | `CONF_YEAR` |
+| | `assistant_name` | Persona the model writes as; byline on pages | `ASSISTANT_NAME` |
+| `[server]` | `host` | Bind interface (`0.0.0.0` = all/LAN) | `TRANSCRIPT_HOST` |
+| | `port` | Server port | `TRANSCRIPT_PORT` |
+| | `token` | Shared secret for `/admin` & write endpoints | `TRANSCRIPT_TOKEN` |
+| | `public_url` | How clients/attendees reach the server | `TRANSCRIPT_URL` |
+| `[stt]` | `model` | NeMo ASR model name | `STT_MODEL` |
+| | `device` | Torch device (`cuda:0`, `cpu`) | `STT_DEVICE` |
+| | `sample_rate` | Audio sample rate (Hz) | `STT_SAMPLE_RATE` |
+| `[llm]` | `url` | OpenAI-compatible chat-completions endpoint | `ALAN_LLM_URL` |
+| | `model` | Model name to request | `ALAN_LLM_MODEL` |
+| | `enabled` | `false` saves talks without AI summaries | `SUMMARIES` |
+| | `max_slides` | Slides (evenly sampled) sent per summary | `SUMMARY_MAX_SLIDES` |
+| `[tuning]` | `save_offset_seconds` | Hold back the last N s at save time | `SAVE_OFFSET_SECONDS` |
+| | `live_flush_seconds` | Crash-recovery snapshot interval | `LIVE_FLUSH_SECONDS` |
+| | `topics_max` | Cap on synthesised key topics | `TOPICS_MAX` |
+
+**Minimum to change for your event:** `[conference]` names, `[server].token` (set
+a strong one!) and `[server].public_url` (the server's LAN address, so the laptop
+client and attendees can reach it), plus `[stt].device` and `[llm].url`/`model`
+to match your hardware.
+
+To run from a config elsewhere, point `CONFIG_FILE` at it:
+`CONFIG_FILE=/path/to/other.toml python3 transcript_server.py`.
+
+## Running an event
+
+### 1 · Start the server (GPU box, start first)
 
 ```bash
-sudo apt install \
-  python3-gi python3-dbus \
-  gstreamer1.0-pipewire gstreamer1.0-plugins-base \
-  gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+python3 transcript_server.py
 ```
 
-### Python dependencies (pip)
+If your NeMo install is a system package, prefix with its path, e.g.
+`PYTHONPATH=/usr/lib/<stt-package> python3 transcript_server.py`. Model loading
+takes ~30 s after a reboot; wait for the **"transcript server live"** line before
+starting capture. The STT model is cached under `~/.cache/torch/NeMo/`.
+
+### 2 · Start capture (laptop)
+
+Find your microphone's device index:
 
 ```bash
-pip install -r requirements.txt
+python3 -c "import sounddevice; print(sounddevice.query_devices())"
 ```
 
-## Running
-
-### On Turing (start first)
+Then run, replacing `N` with that index:
 
 ```bash
-PYTHONPATH=/usr/lib/turing-voice python3 transcript_server.py
+python3 live_transcribe.py --device N
 ```
 
-Model loading takes ~30s. Wait for "Transcript server live" before starting the laptop script.
+On first run a one-time screen-capture permission dialog appears — approve it;
+after that it runs silently. To capture **shared computer audio** instead of the
+mic (e.g. a remote Zoom speaker), use `python3 live_transcribe.py --zoom`.
 
-### On your laptop
+### 3 · Attendees
 
-```bash
-python3 live_transcribe.py
-```
+Open `[server].public_url` (e.g. `http://172.24.17.90:7103`) on any device on the
+network. This page is **view-only** — no controls, no token.
 
-On first run, a one-time permission dialog appears for screen capture. After that it runs silently — screenshots are taken each chunk and sent only if the slide has changed significantly. The last sent slide is cached at `~/Pictures/SBI4GALEV/last_sent.jpg`.
+### 4 · Operator (saving talks)
 
-### Attendees
+Open `<public_url>/admin?token=<your-token>`. This is the same live view plus an
+**End talk & Save** button and an optional speaker/title field. At the end of a
+talk, type the speaker/title and press **Save**; the server bundles everything
+recorded so far and resets for the next speaker. Keep this URL private — anyone
+with it can end a talk.
 
-Open `http://172.24.17.90:7103` on any device connected to the Cambridge UDN. This page is **view-only** — it carries no controls and no auth token.
+## The context store (data model)
 
-### Operator (saving talks)
-
-Open `http://172.24.17.90:7103/admin?token=sbi4galev` (replace the token with whatever `TRANSCRIPT_TOKEN` is set to). This is the same live view plus an **End talk & Save** button and an optional speaker/title field.
-
-At the end of a talk, type the speaker/title (optional) and press **Save**. The server bundles everything recorded so far into a dedicated folder and resets the live view for the next speaker. Keep the `/admin` URL to yourself — anyone with it can end a talk.
-
-## Saved talks
-
-Each Save writes one self-contained, read-only folder:
+The context store is the corpus the system captures and then reasons over: the
+per-talk transcripts, slides and screenshots, their timing and metadata, and any
+other context you add (for example the official schedule abstracts). It lives
+under `transcripts/`, one self-contained folder per talk, named
+`<timestamp>[_<speaker-slug>]`. Each save writes one such folder, and the LLM
+agent later writes its summary back alongside the raw material:
 
 ```
 transcripts/
   2026-06-23_09-15-00_jane-smith/
     transcript.txt      # plain-text transcript
-    transcript.html     # transcript + slides interleaved, open in a browser to review
+    transcript.html     # transcript + slides interleaved (open in a browser)
     session.json        # ordered text/slide items with timestamps
-    metadata.json       # label, save time, slide/chunk counts, first/last timestamps
+    metadata.json       # label, save time, slide/chunk counts, timestamps
     summary.json        # LLM summary (title, speaker, abstract, key_points, topics)
-    summary.md          # the same summary as readable Markdown
-    questions.json      # three kind speaker questions (votes live in ../../votes/)
+    summary.md          # the same summary as Markdown
+    questions.json      # three suggested speaker questions
     slides/
-      slide_001.jpg
-      slide_002.jpg
+      slide_001.jpg …
 ```
 
-The folder is named `<timestamp>[_<label-slug>]`. Once the summary has been generated the folder and its contents are made read-only (`0555`/`0444`), and **there is no HTTP endpoint that deletes or modifies saved talks** — they cannot be removed through the browser or a POST. (To delete one deliberately on the server you must first restore write permission, e.g. `chmod -R u+w <folder>`. For tamper-proof storage beyond accidental loss, run `chattr +i` on the folder as root or move it to WORM/backup storage.)
+Once its summary lands a talk folder is made read-only (`0555`/`0444`), and no HTTP
+endpoint can delete or change a saved talk. The in-progress talk is held in memory
+and snapshotted to `transcripts/.live.json` every `live_flush_seconds`, so it
+survives a crash or restart. The store itself is git-ignored: the raw recordings
+are never committed, and only the curated static archive is ever published.
 
-Saving requires nothing recorded to be discarded: if nothing has been captured since the last save, Save is a no-op.
+## AI features
 
-## Talk summaries
+These need an LLM endpoint (`[llm].enabled = true`); everything below is the LLM
+agent reading the context store. Generation runs off the Save response, so the
+reset for the next speaker is instant, and is serialised so back-to-back saves
+queue rather than overload the model.
 
-After each Save, a background worker sends the talk's transcript plus a sample of its slides (up to `SUMMARY_MAX_SLIDES`, default 8, evenly spaced) to the local model and writes `summary.json` / `summary.md` / `questions.json` into the talk folder. This runs **off** the Save response, so the reset for the next speaker is instant; the folder is finalised read-only once the summary lands (typically a few seconds). Generation is serialised, so back-to-back saves queue rather than overload the GPU.
+Each talk is summarised from its transcript and slides into a title, speaker,
+abstract, key points and topic tags, shown newest-first at `GET /summaries` with a
+slide thumbnail. The summaries never link to the raw transcript. The
+same pass suggests three constructive questions per talk, which attendees vote on
+anonymously (`POST /vote`); because talk folders are read-only the votes live
+separately under `votes/`. Each summary also links to up to three earlier talks
+chosen by topic and title overlap.
 
-- **`GET /summaries`** — public page listing every saved talk newest-first: title, speaker, abstract, key points, topic tags, a slide thumbnail, three speaker questions (see below), and links to related talks. A talk with no summary yet shows "generating…"; a failed one shows "unavailable". It deliberately does **not** link to the raw transcript.
-- **`GET /talks/<folder>/<file>`** — read-only static access to saved files (path-traversal guarded). Slides, `summary.json`/`summary.md`, and `metadata.json` are public; the **full transcript files** (`transcript.txt`, `transcript.html`, `session.json`) are served only with the admin token, e.g. `…/transcript.html?token=sbi4galev`.
+Across the whole store the agent keeps two syntheses fresh. Per-day overviews
+(cached in `day_summaries/`) are rebuilt whenever a day's set of talks changes. The
+conference-wide key-topics page (`GET /topics`, cached in `topic_summaries/`)
+clusters every talk's topic tags into the meeting's main threads and draws a graph
+linking each topic back to the talks that raised it; if the model is unreachable it
+falls back to plain keyword aggregation.
 
-### Speaker questions & voting
+If the endpoint is down a talk is still saved, with its summary marked
+unavailable — regenerate it later with `backfill_summaries.py`.
 
-Each summary includes three **kind, considerate questions** for the speaker, generated in the same LLM call with a prompt that insists they be warm, curious and encouraging — never harsh, sceptical or confrontational. They appear in a "Questions for the speaker" dropdown on `/summaries`, each with thumbs up / down.
+## Publishing a public archive
 
-- **`POST /vote`** `{folder, qid, from, to}` — public and anonymous; records a vote and returns the new `{up, down}`. Questions are ordered by score (most upvotes / fewest downvotes first), re-sorting live as people vote.
-- Because finalised talk folders are read-only, votes live in a separate writable `votes/<folder>.json`. Each browser gets one vote per question (tracked in `localStorage`, click again to change or undo) — lightweight, not authenticated.
+`export_static.py` renders a curated subset of the context store — `/summaries`,
+the per-day pages and `/topics` — into a self-contained `site/` of plain HTML and
+the slide thumbnails it references, with the server-only behaviour (live SSE,
+voting, absolute links) stripped out. It reuses the server's own render functions,
+so run it on the GPU box, where the context store lives (and the LLM, for any stale
+day or topic caches).
 
-### Related talks
+### Permissions allowlist (fail-closed)
 
-Each summary links to up to **three related earlier talks**, chosen at render time by topic- and title-keyword overlap among talks saved before it. The links jump to those talks' cards on the same page.
+Publishing is **opt-in per speaker**. [`public_talks.txt`](public_talks.txt)
+lists the approved talks, one folder name (or readable slug) per line; anything
+not listed is excluded, and a missing/empty file exports nothing. To add a
+speaker once they grant permission, uncomment/add their line and re-export.
 
-### Transcript privacy
+### Build & deploy
 
-Public viewers get the live transcript (as it streams), the slides, and the AI summaries — but the **saved full transcript is not downloadable** by them. The verbatim record stays on disk and is reachable only with the token (the `/admin` operator, or `…?token=` on a `/talks` transcript URL). To regenerate or backfill summaries, run `python3 backfill_summaries.py`.
+```bash
+python3 export_static.py --clean
+git add site && git commit -m "Update static archive" && git push
+```
 
-The model is **alan's engine**: `google/gemma-4-31b-it` served by SGLang at `127.0.0.1:30000` (OpenAI-compatible, multimodal). alan itself is an interactive TUI, so the server talks to the same underlying model directly. Override with env vars `ALAN_LLM_URL` and `ALAN_LLM_MODEL`, or disable summaries entirely with `SUMMARIES=0`. If the model endpoint is unreachable the talk is still saved — only the summary is marked unavailable.
+A GitHub Actions workflow ([`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml))
+publishes the committed `site/` to GitHub Pages on every push that touches it
+(it serves what you commit — it does **not** rebuild). One-time setup: repo
+**Settings → Pages → Source: GitHub Actions**. Deploys use the workflow's
+built-in `GITHUB_TOKEN`, so no personal credentials are needed.
 
-## Files
+Useful flags: `--no-llm` (skip the model; topics use the keyword fallback),
+`--all-slides`, `--strict` (treat missing summaries as errors), `-v`. Serve a
+build locally with `python3 -m http.server -d site 8000`.
+
+## White papers
+
+**`whitepaper.py`** writes the meeting's summary white paper: a ≤3-page LaTeX document built by the LLM agent from the context store — the on-box summaries, day overviews and topic synthesis.
+Pass last year's abstract booklet (or drop an `*abstract*booklet*.pdf` in the repo root) for a grounded year-on-year comparison.
+Needs `pdftotext` or `pdfminer.six` to read a PDF booklet, and `latexmk`/`pdflatex` for `--pdf`.
+```bash
+python3 whitepaper.py --refresh --pdf
+```
+
+Generated `.tex`/`.pdf` are git-ignored (reproducible from the script).
+
+## Maintenance scripts
+
+All run on the GPU box and reuse `transcript_server`'s generators:
+
+- **`backfill_summaries.py [--force] [folder …]`** — summarise talks saved
+  without one (e.g. before summaries existed, or after a model outage).
+- **`backfill_day_summaries.py [--force] [YYYY-MM-DD …]`** — warm/rebuild the
+  per-day overviews.
+- **`backfill_topics.py [--force] [--no-llm]`** — warm/rebuild the key-topics
+  synthesis.
+
+### Re-cutting talk boundaries
+
+The "End talk & Save" click is mistimed relative to the speech-to-text lag, so a
+talk's opening can be trapped at the end of the previous folder, or its ending can
+spill into the next. `fix_transcript_cuts.py` repairs this entirely on-box:
+
+```bash
+python3 fix_transcript_cuts.py analyze                  # timeline, markers, boundary windows
+python3 fix_transcript_cuts.py propose --out plan.json  # the local LLM decides the cuts
+python3 fix_transcript_cuts.py apply plan.json --dry-run
+python3 fix_transcript_cuts.py apply plan.json          # backs up, rebuilds, re-locks, verifies
+python3 backfill_summaries.py --force <changed-folder> ...   # refresh the moved talks' summaries
+```
+
+`propose` sends each boundary window to the same local model as the summaries, so
+no transcript leaves the LAN. It only writes a plan — you review it and `apply` it
+yourself, with the originals backed up under `transcripts/.backups/`. Splitting a
+folder that bundles several talks or a break is done with a hand-written plan (the
+schema is documented at the top of the script).
+
+
+## Script reference
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `transcript_server.py` | Turing | NeMo STT + SSE website server + summaries |
-| `backfill_summaries.py` | Turing | Generate summaries for talks saved without one |
-| `live_transcribe.py` | Laptop | Mic capture + silent screen capture → POST to server |
-| `screen_capture.py` | Laptop | PipeWire/ScreenCast portal screen capture class |
-| `screenshot_watcher.py` | Laptop | Legacy: watches ~/Pictures/Screenshots for manual Print Screen |
-| `test_transducer.py` | Turing | One-shot benchmark for the transducer model |
+| `config.toml` / `config.py` | both | Single source of truth for all settings |
+| `transcript_server.py` | server | NeMo STT + SSE site + summaries/topics |
+| `live_transcribe.py` | laptop | Mic/system-audio capture + silent slide capture → POST |
+| `screen_capture.py` | laptop | PipeWire/ScreenCast portal capture (used by the above) |
+| `export_static.py` | server | Render the archive to a static `site/` for Pages |
+| `public_talks.txt` | server | Per-speaker publish allowlist (fail-closed) |
+| `backfill_summaries.py` | server | Generate summaries for talks missing one |
+| `backfill_day_summaries.py` | server | Generate/refresh per-day overviews |
+| `backfill_topics.py` | server | Generate/refresh the key-topics synthesis |
+| `fix_transcript_cuts.py` | server | Re-cut mis-bounded talk folders (local-LLM proposal) |
+| `whitepaper.py` | server | Conference **summary** white paper (via the LLM agent) |
+| `whitepaper/ambient_ai_whitepaper.py` | server | Methods paper about the system |
+| `test_transducer.py` | server | One-shot STT smoke test / benchmark |
 
-## Config
+## Privacy & security
 
-Scripts use token `sbi4galev` (env `TRANSCRIPT_TOKEN`) for authentication on `/transcribe`, `/push`, `/image`, and `/save`. The public, read-only pages (`GET /`, `GET /summaries`, `GET /talks/…`) are open to anyone on the UDN and carry no token; the operator page (`GET /admin?token=…`) requires the token and is the only place the Save control is exposed. Set a stronger `TRANSCRIPT_TOKEN` for real events.
+Keeping the context store private is the main design goal. If you point `[llm].url`
+at a model running on your own hardware, the whole pipeline stays on the LAN and no
+transcript, slide or abstract ever leaves the building. Pointing it at an external
+API is supported too, but then the slices of the context store sent for
+summarisation do leave your network, so choose that endpoint accordingly.
 
-Server binds to `0.0.0.0:7103` — accessible on UDN only (Turing is not internet-facing).
+The write endpoints (`/admin`, `/save`, `/transcribe`, `/image`, `/push`) require
+`[server].token`; the public pages (`/`, `/summaries`, `/topics` and `/talks/…`
+assets) carry none, so set a strong token for a real event. Public viewers see the
+live stream, the slides and the AI summaries, but not the verbatim transcript: the
+full transcript files are served only with the token (`…?token=…`).
 
-STT model: `stt_en_fastconformer_transducer_xxlarge`, cached at `~/.cache/torch/NeMo/` on Turing. First start after a reboot loads in ~30s.
-
-## Turing-side dependencies
-
-Already installed as part of the `turing-voice` system package:
-- NeMo (`nemo_toolkit[asr]`)
-- ffmpeg
-- CUDA drivers
+Finalised talk folders are read-only and no endpoint can delete or modify them; for
+stronger guarantees run `chattr +i` on them or move them to WORM/backup storage.
+Keep the server on the LAN and publish only the curated static archive, through the
+permissions allowlist.

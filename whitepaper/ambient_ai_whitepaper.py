@@ -55,6 +55,9 @@ def gather_facts() -> dict:
     else:
         date_range = "the meeting"
     return {
+        "CONF_SHORT": _latex_escape(ts.CONF_SHORT),
+        "CONF_FULL": _latex_escape(ts.CONF_FULL),
+        "ASSISTANT": _latex_escape(ts.ASSISTANT_NAME),
         "NTALKS": str(n_talks) if n_talks else "the",
         "NDAYS": str(n_days) if n_days else "several",
         "DATERANGE": _latex_escape(date_range),
@@ -100,8 +103,8 @@ projected slides, and --- without any human writing a word --- produces per-talk
 summaries, audience questions, per-day overviews, a conference-wide topic graph,
 and finally a multi-page summary white paper. Every model runs on local
 hardware: no transcript, slide or abstract is ever sent to an external service.
-The system was deployed at the Simulation-Based Inference for Galaxy Evolution
-(SBI4GALEV) meeting, where it processed @@NTALKS@@ talks across @@NDAYS@@ days
+The system was deployed at the @@CONF_FULL@@
+(@@CONF_SHORT@@) meeting, where it processed @@NTALKS@@ talks across @@NDAYS@@ days
 (@@DATERANGE@@). We describe the architecture, the implementation choices that
 made it robust in a live setting, the hardware and models, and our reflections on
 what worked and what did not. This document is deliberately the one artifact the
@@ -225,7 +228,7 @@ between the browser and the local server.
         ``XXL'' configuration) --- run on the GPU (\texttt{@@DEVICE@@}) at
         @@SAMPLE_RATE@@ audio. It transcribes streamed audio chunks with low
         enough latency to drive the live view.
-  \item \textbf{Vision-language summarisation and synthesis (``alan'').} A
+  \item \textbf{Vision-language summarisation and synthesis (``@@ASSISTANT@@'').} A
         \texttt{@@LLM_MODEL@@} instruction-tuned model, served locally through
         SGLang behind an OpenAI-compatible endpoint (\texttt{@@LLM_URL@@}). It is
         multimodal: each summary request carries up to @@MAX_SLIDES@@ slide
@@ -297,7 +300,7 @@ without surrendering the room's privacy. The combination of a real-time local
 transcriber, a multimodal local summariser grounded against the official
 programme, an append-only immutable archive, and a synthesis stage that scales
 from one talk to a whole-conference white paper produced a useful record of
-SBI4GALEV with minimal human effort. The remaining rough edges --- chiefly talk
+@@CONF_SHORT@@ with minimal human effort. The remaining rough edges --- chiefly talk
 boundaries and the limits of automatic transcription --- are tractable, and none
 of them require giving up the property that matters most: it all runs at home.
 
