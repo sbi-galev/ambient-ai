@@ -46,13 +46,13 @@ Plan schema:
     "backup_label": "recut",                 # optional tag for the backup dir
     "operations": [
       {
-        "dest": "2026-..._harvey-intro",     # folder NAME (created or overwritten)
+        "dest": "2026-..._second-talk",      # folder NAME (created or overwritten)
         "bin": false,                         # true -> placed under transcripts/bin/
-        "label": "Harvey intro",             # optional; defaults to first segment src's
+        "label": "Second talk",              # optional; defaults to first segment src's
         "saved_at": "2026-06-23T10:19:21",   # optional; defaults to first segment src's
         "segments": [
-          {"src": "2026-..._chris-lovell", "start": 155, "end": 170},
-          {"src": "2026-..._harvey-intro", "start": 0,   "end": 302}
+          {"src": "2026-..._first-talk", "start": 155, "end": 170},
+          {"src": "2026-..._second-talk", "start": 0,   "end": 302}
         ]
       }
     ]

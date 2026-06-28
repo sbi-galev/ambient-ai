@@ -1,10 +1,14 @@
 # Allowlist of talks approved for public export (GitHub Pages).
 #
-# One transcript folder name per line. ONLY talks listed here are written into
-# site/ by export_static.py; everything else is excluded (fail-closed). To add a
-# speaker once they grant permission, uncomment / add their folder and re-run
+# One transcript folder name (or readable slug) per line. ONLY talks listed here
+# are written into site/ by export_static.py; everything else is excluded
+# (fail-closed). To publish a talk once its speaker grants permission, add its
+# slug here and re-run:
 #   python3 export_static.py --clean
 # Blank lines and lines starting with # are ignored.
+#
+# Talks still awaiting permission are tracked locally in public_talks.pending.txt
+# (git-ignored), so unauthorised speakers' names stay out of this repository.
 #
 # ── Permission granted (speaker talks) ──────────────────────────────────────
 
@@ -50,27 +54,3 @@ introduction-chris-lovell
 chris-lovell
 data-challenge
 synference-tutorial
-
-# ── Awaiting permission (kept OUT of the public site for now) ────────────────
-# Uncomment a line once the speaker grants permission, then re-export.
-#harvey-intro                       # Tom Harvey
-#suchetha-cooray
-#luca-tortorelli
-#benedict-van-den-bussche
-#nicholas-choustikov
-#richard-stiskalek
-#niall-jeffries
-#lujcas-makinen                     # Lucas Makinen
-#maximilian-von-wietersheim-kramsta
-#teresa-matamoro
-#chenze-dong
-#giuseppe-viterbo
-#joey-braspenning
-#sinan-deger
-#dakshesh-kololgi
-#timo-kist
-#deaglan-bartlett
-#richard-brooks
-#thomas-bebbington
-#carolina-cuesta-lazaro             # Carolina Cuesta-Lázaro (NB: permission on file is for Carolina M. García López — verify identity)
-#alex-alarcon

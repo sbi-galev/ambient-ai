@@ -8,6 +8,9 @@ topic_summaries/
 votes/
 .claude/settings.local.json
 
+# Local-only list of talks awaiting permission (keeps unauthorised names out of git)
+public_talks.pending.txt
+
 # LaTeX build intermediates (from whitepaper.py / ambient_ai_whitepaper.py --pdf)
 *.aux
 *.fls
