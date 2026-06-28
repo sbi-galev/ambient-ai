@@ -991,13 +991,26 @@ def _words(s: str) -> set:
             if len(w) > 2 and w not in _STOPWORDS}
 
 
+def _is_intro(folder: str) -> bool:
+    """The opening introduction/welcome session, identified by its slug (e.g.
+    'introduction-chris-lovell' or 'harvey-intro'). Not a research talk, so it's
+    never suggested as a 'related talk'."""
+    slug = re.sub(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_", "", folder)
+    return slug.startswith("introduction") or slug.endswith("-intro") or slug == "intro"
+
+
 def _related_talks(t: dict, talks: list, k: int = 3):
-    """Up to k earlier talks most similar to t, by topic + title-word overlap."""
+    """Up to k talks from across the WHOLE programme most similar to t, by topic +
+    title-word overlap (earlier and later alike). Recomputed on every render, so
+    each talk's list always reflects every talk saved so far — during a live event
+    an early talk picks up its later relatives the next time its page is served."""
     cur_topics, cur_title = set(t["topics"]), _words(t["title"])
     scored = []
     for o in talks:
-        if o["folder"] == t["folder"] or o["saved_at"] >= t["saved_at"]:
-            continue  # only earlier ("previous") talks
+        if o["folder"] == t["folder"]:
+            continue  # not itself
+        if _is_intro(o["folder"]):
+            continue  # the intro session is not a research talk
         s = 0.0
         ot = set(o["topics"])
         if cur_topics and ot:
@@ -1294,11 +1307,88 @@ def _keyword_fallback_clusters(vocab: list, kw_to_folders: dict) -> list:
             for kw in sorted(vocab, key=lambda k: (-len(kw_to_folders[k]), k))]
 
 
+def _folder_refs(folders, by_folder: dict) -> list:
+    """Sorted talk references ({folder,title,date}) for a set of folder names."""
+    return sorted(
+        ({"folder": f, "title": by_folder[f]["title"], "date": _talk_day(by_folder[f])}
+         for f in folders if f in by_folder),
+        key=lambda r: r["title"].lower())
+
+
+def _merge_topic_variants(topics: list) -> list:
+    """Collapse topics that name the same concept in different forms — an acronym,
+    its spelled-out form, or the spelled-out form with the acronym in parentheses
+    (e.g. 'SBI', 'simulation-based inference', 'simulation-based inference (SBI)').
+    Unions their keywords and talks so each concept appears exactly once. Operates
+    on resolved topic dicts (with a `talks` list), so it also repairs cached
+    syntheses, not just freshly generated ones."""
+    def canon(name):  # base form: drop any parenthetical, keep alnum words
+        base = re.sub(r"\([^)]*\)", " ", name.lower())
+        return re.sub(r"[^a-z0-9]+", " ", base).strip()
+
+    # Any acronym written in parentheses maps a bare-acronym topic to the base.
+    acro_to_base = {}
+    for tp in topics:
+        base = canon(tp["name"])
+        for ac in re.findall(r"\(([^)]+)\)", tp["name"]):
+            a = re.sub(r"[^a-z0-9]+", "", ac.lower())
+            if a and base:
+                acro_to_base[a] = base
+
+    def gkey(name):
+        base = canon(name)
+        flat = re.sub(r"[^a-z0-9]+", "", base)
+        return acro_to_base.get(flat, base) or name.lower()
+
+    groups, order = {}, []
+    for tp in topics:
+        k = gkey(tp["name"])
+        if k not in groups:
+            groups[k] = {**tp, "talks": list(tp["talks"]), "keywords": list(tp["keywords"])}
+            order.append(k)
+            continue
+        m = groups[k]
+        # Prefer the most informative label: the expansion-with-acronym, else longer.
+        if ("(" in tp["name"]) and ("(" not in m["name"]):
+            m["name"] = tp["name"]
+        elif (("(" in tp["name"]) == ("(" in m["name"])) and len(tp["name"]) > len(m["name"]):
+            m["name"] = tp["name"]
+        if not m.get("description"):
+            m["description"] = tp.get("description", "")
+        for kw in tp["keywords"]:
+            if kw not in m["keywords"]:
+                m["keywords"].append(kw)
+        have = {r["folder"] for r in m["talks"]}
+        for r in tp["talks"]:
+            if r["folder"] not in have:
+                m["talks"].append(r)
+                have.add(r["folder"])
+    merged = []
+    for k in order:
+        tp = groups[k]
+        tp["talks"].sort(key=lambda r: r["title"].lower())
+        tp["count"] = len(tp["talks"])
+        merged.append(tp)
+    return merged
+
+
+def _topic_edges(topics: list) -> list:
+    """Co-occurrence edges between topics, weighted by shared talks."""
+    fsets = [{r["folder"] for r in tp["talks"]} for tp in topics]
+    edges = []
+    for i in range(len(topics)):
+        for j in range(i + 1, len(topics)):
+            w = len(fsets[i] & fsets[j])
+            if w:
+                edges.append({"source": i, "target": j, "weight": w})
+    return edges
+
+
 def _resolve_topic_clusters(clusters: list, kw_to_folders: dict, talks: list):
     """Turn [{name, description, keywords}] into ranked topic dicts with grounded
     talk references and co-occurrence edges. A topic's talks are the union of the
     talks tagged with any of its keywords, so every reference is real. Drops topics
-    that match no talk, de-duplicates by name, and caps at TOPICS_MAX."""
+    that match no talk, merges acronym/expansion variants, and caps at TOPICS_MAX."""
     by_folder = {t["folder"]: t for t in talks}
     topics, seen = [], set()
     for c in clusters:
@@ -1317,23 +1407,13 @@ def _resolve_topic_clusters(clusters: list, kw_to_folders: dict, talks: list):
         if not folders:
             continue
         seen.add(name.lower())
-        refs = sorted(
-            ({"folder": f, "title": by_folder[f]["title"], "date": _talk_day(by_folder[f])}
-             for f in folders),
-            key=lambda r: r["title"].lower())
         topics.append({"name": name, "description": str(c.get("description") or "").strip(),
-                       "keywords": kws, "talks": refs, "count": len(refs), "_folders": folders})
+                       "keywords": kws, "talks": _folder_refs(folders, by_folder),
+                       "count": len(folders)})
+    topics = _merge_topic_variants(topics)
     topics.sort(key=lambda x: (-x["count"], x["name"].lower()))
     topics = topics[:TOPICS_MAX]
-    edges = []
-    for i in range(len(topics)):
-        for j in range(i + 1, len(topics)):
-            w = len(topics[i]["_folders"] & topics[j]["_folders"])
-            if w:
-                edges.append({"source": i, "target": j, "weight": w})
-    for tp in topics:
-        del tp["_folders"]
-    return topics, edges
+    return topics, _topic_edges(topics)
 
 
 def _generate_topics_summary(talks: list, use_llm: bool) -> dict:
@@ -1456,7 +1536,13 @@ def _load_talks() -> list:
         slides = sorted((d / "slides").glob("slide_*.jpg")) if (d / "slides").is_dir() else []
         talks.append({
             "folder": d.name, "meta": meta, "summary": summary, "questions": questions,
-            "votes": _load_votes(d.name), "thumb": slides[0].name if slides else None,
+            "votes": _load_votes(d.name),
+            # First (title) slide is the card's main example; the full list drives
+            # the lightbox. Both are read live from disk, so culling slides (moving
+            # them out of slides/) is reflected immediately with no metadata edits.
+            "slides": [s.name for s in slides],
+            "thumb": slides[0].name if slides else None,
+            "n_slides": len(slides),
             "saved_at": meta.get("saved_at") or d.name,
             "title": (summary or {}).get("title") or meta.get("label") or d.name,
             "topics": [str(x).lower() for x in (summary or {}).get("topics", [])],
@@ -1468,18 +1554,20 @@ def _load_talks() -> list:
 
 SUMMARIES_CSS = """
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background:#0a0a0a; color:#ddd; font-family:sans-serif; padding:48px 20px 96px; }
+    body { background:#0a0a0a; color:#e6e6e6; font-family:sans-serif; font-size:16.5px;
+        line-height:1.5; padding:48px 20px 96px; }
     .wrap { max-width:860px; margin:0 auto; }
     header.top { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:2em; }
-    header.top h1 { font-size:1.3em; font-weight:600; letter-spacing:0.5px; }
-    header.top .navlinks a { color:#555; font-size:0.7em; letter-spacing:1px; text-decoration:none; margin-left:14px; }
-    header.top .navlinks a:hover { color:#aaa; }
+    header.top h1 { font-size:1.5em; font-weight:600; letter-spacing:0.5px; color:#fff; }
+    header.top .navlinks a { color:#9ec9b0; font-size:0.95em; letter-spacing:0.5px;
+        text-decoration:none; margin-left:20px; }
+    header.top .navlinks a:hover { color:#fff; }
     .day { padding:28px 0; border-top:1px solid #1a1a1a; }
     .day-head { display:flex; align-items:baseline; gap:14px; margin-bottom:0.2em; }
     .day-head h2 { font-size:1.15em; font-weight:700; color:#fff; letter-spacing:0.5px; }
     .day-head .date { color:#777; font-size:0.8em; }
     .day-head .count { color:#555; font-size:0.72em; letter-spacing:1px; margin-left:auto; }
-    .day-overview { color:#cfcfcf; line-height:1.7; margin:0.7em 0 0.9em; }
+    .day-overview { color:#dcdcdc; line-height:1.7; margin:0.7em 0 0.9em; font-size:1.03em; }
     .day-thumbs { display:flex; gap:8px; overflow:hidden; margin:0.6em 0 0.9em; }
     .day-thumbs img { height:74px; border:1px solid #222; border-radius:4px; display:block; }
     .day-talklist { list-style:none; margin:0.4em 0 0; padding:0; }
@@ -1490,15 +1578,36 @@ SUMMARIES_CSS = """
     .day-more { display:inline-block; margin-top:0.9em; color:#6a8; font-size:0.8em;
                 text-decoration:none; letter-spacing:0.5px; }
     .day-more:hover { text-decoration:underline; }
-    .day-page-overview { color:#cfcfcf; line-height:1.75; margin:0.4em 0 0.6em; font-size:1.02em; }
+    .day-page-overview { color:#dcdcdc; line-height:1.8; margin:0.4em 0 0.6em; font-size:1.1em; }
+    .day-nav { display:flex; justify-content:space-between; gap:16px; margin-top:52px;
+        padding-top:30px; border-top:1px solid #1a1a1a; }
+    .day-nav a { display:flex; flex-direction:column; gap:3px; color:#cdd; text-decoration:none;
+        padding:12px 20px; border:1px solid #1f1f1f; border-radius:8px; background:#0e0e0e;
+        transition:border-color 0.15s, background 0.15s; }
+    .day-nav a:hover { border-color:#3a5a48; background:#101410; }
+    .day-nav .next { margin-left:auto; text-align:right; }
+    .day-nav .dn-dir { color:#9ec9b0; font-size:0.8em; letter-spacing:1px; text-transform:uppercase; }
+    .day-nav a:hover .dn-dir { color:#fff; }
+    .day-nav .dn-day { color:#fff; font-size:1.1em; font-weight:600; }
     .card { display:flex; gap:20px; padding:24px 0; border-top:1px solid #1a1a1a; }
-    .card .thumb { flex:0 0 200px; }
-    .card .thumb img { width:100%; border:1px solid #222; border-radius:6px; display:block; }
+    .card .thumb { flex:0 0 200px; position:relative; display:block; cursor:zoom-in; }
+    .card .thumb img { width:100%; border:1px solid #222; border-radius:6px; display:block;
+        transition:border-color 0.15s; }
+    .card .thumb:hover img { border-color:#3a5a48; }
+    .card .thumb .thumb-count { position:absolute; bottom:8px; right:8px; color:#fff;
+        background:rgba(0,0,0,0.72); font-size:0.72em; letter-spacing:0.5px; padding:3px 8px;
+        border-radius:5px; pointer-events:none; }
+    .card .thumb-none { flex:0 0 200px; align-self:flex-start; height:120px; display:flex;
+        align-items:center; justify-content:center; text-align:center; color:#666;
+        font-size:0.82em; border:1px dashed #2c2c2c; border-radius:6px; background:#0e0e0e; }
+    .cap-notes { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 0.8em; }
+    .cap-note { font-size:0.72em; letter-spacing:0.5px; color:#d2a24c; border:1px solid #3a3326;
+        background:#1a1710; border-radius:10px; padding:2px 9px; }
     .card-body { flex:1; min-width:0; }
     .card h2 { font-size:1.05em; font-weight:600; color:#fff; margin-bottom:0.2em; }
     .when { color:#555; font-size:0.7em; letter-spacing:1px; margin-bottom:0.9em; }
     .speaker { color:#9a9; font-size:0.85em; margin-bottom:0.6em; }
-    .abstract { color:#bbb; line-height:1.65; margin-bottom:0.8em; }
+    .abstract { color:#cccccc; line-height:1.7; margin-bottom:0.8em; }
     .official-abstract { margin:0 0 0.8em 0; }
     .official-abstract > summary { color:#7fa7d6; cursor:pointer; font-size:0.85em;
         text-transform:uppercase; letter-spacing:0.04em; }
@@ -1559,7 +1668,85 @@ SUMMARIES_CSS = """
     .spinner { display:inline-block; width:13px; height:13px; border:2px solid #2c2c2c;
         border-top-color:#9a9; border-radius:50%; animation:spin 0.8s linear infinite;
         vertical-align:middle; margin-right:8px; }
-    @keyframes spin { to { transform:rotate(360deg); } }"""
+    @keyframes spin { to { transform:rotate(360deg); } }
+    /* Slide lightbox */
+    .lb { position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:1000;
+        display:none; flex-direction:column; }
+    .lb.open { display:flex; }
+    .lb-top { display:flex; align-items:center; justify-content:space-between;
+        padding:16px 22px; color:#cdd; font-size:0.9em; letter-spacing:0.5px; }
+    .lb-title { color:#fff; font-weight:600; max-width:80%; overflow:hidden;
+        text-overflow:ellipsis; white-space:nowrap; }
+    .lb-close { background:none; border:none; color:#9ec9b0; font-size:1.8em; line-height:1;
+        cursor:pointer; padding:0 6px; }
+    .lb-close:hover { color:#fff; }
+    .lb-stage { flex:1; display:flex; align-items:center; justify-content:center;
+        gap:12px; padding:0 16px 8px; min-height:0; }
+    .lb-stage img { max-width:100%; max-height:100%; object-fit:contain;
+        border:1px solid #222; border-radius:6px; }
+    .lb-nav { background:rgba(255,255,255,0.06); border:1px solid #2a2a2a; color:#fff;
+        font-size:1.6em; line-height:1; cursor:pointer; border-radius:8px; padding:14px 18px;
+        flex:0 0 auto; user-select:none; }
+    .lb-nav:hover { background:rgba(158,201,176,0.18); border-color:#3a5a48; }
+    .lb-nav[disabled] { opacity:0.25; cursor:default; }
+    .lb-count { text-align:center; color:#888; font-size:0.85em; padding:6px 0 18px;
+        letter-spacing:1px; font-variant-numeric:tabular-nums; }"""
+
+
+# Slide lightbox: a self-contained click-to-zoom gallery. Kept SEPARATE from
+# SUMMARIES_JS (which export_static strips out, along with live voting/SSE) so it
+# survives into the static archive. Delegated click handling means it works for
+# any a.thumb on the page, server-rendered or static.
+LIGHTBOX_JS = """<script>
+(function () {
+  var slides = [], idx = 0, title = "";
+  var lb = document.createElement('div');
+  lb.className = 'lb';
+  lb.innerHTML =
+    '<div class="lb-top"><span class="lb-title"></span>'
+    + '<button class="lb-close" aria-label="Close">&times;</button></div>'
+    + '<div class="lb-stage"><button class="lb-nav lb-prev" aria-label="Previous">&#8249;</button>'
+    + '<img alt="slide">'
+    + '<button class="lb-nav lb-next" aria-label="Next">&#8250;</button></div>'
+    + '<div class="lb-count"></div>';
+  document.body.appendChild(lb);
+  var img = lb.querySelector('img'), stage = lb.querySelector('.lb-stage'),
+      elTitle = lb.querySelector('.lb-title'), elCount = lb.querySelector('.lb-count'),
+      btnPrev = lb.querySelector('.lb-prev'), btnNext = lb.querySelector('.lb-next');
+  function show() {
+    img.src = slides[idx];
+    elTitle.textContent = title;
+    elCount.textContent = (idx + 1) + ' / ' + slides.length;
+    btnPrev.disabled = idx <= 0;
+    btnNext.disabled = idx >= slides.length - 1;
+  }
+  function open(arr, t, start) {
+    if (!arr || !arr.length) return;
+    slides = arr; title = t || ''; idx = start || 0;
+    lb.classList.add('open'); show();
+  }
+  function close() { lb.classList.remove('open'); img.src = ''; }
+  function go(d) { idx = Math.max(0, Math.min(slides.length - 1, idx + d)); show(); }
+  document.addEventListener('click', function (e) {
+    var a = e.target.closest('a.thumb'); if (!a) return;
+    var data = a.getAttribute('data-slides'); if (!data) return;
+    var arr; try { arr = JSON.parse(data); } catch (_) { return; }
+    if (!arr.length) return;
+    e.preventDefault(); open(arr, a.getAttribute('data-title'), 0);
+  });
+  btnPrev.addEventListener('click', function () { go(-1); });
+  btnNext.addEventListener('click', function () { go(1); });
+  lb.querySelector('.lb-close').addEventListener('click', close);
+  lb.addEventListener('click', function (e) { if (e.target === lb) close(); });
+  stage.addEventListener('click', function (e) { if (e.target === stage) close(); });
+  document.addEventListener('keydown', function (e) {
+    if (!lb.classList.contains('open')) return;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') go(-1);
+    else if (e.key === 'ArrowRight') go(1);
+  });
+})();
+</script>"""
 
 
 def _page_shell(title: str, heading: str, nav_html: str, body: str) -> str:
@@ -1577,8 +1764,27 @@ def _page_shell(title: str, heading: str, nav_html: str, body: str) -> str:
     {body}
   </div>
   {SUMMARIES_JS}
+  {LIGHTBOX_JS}
 </body>
 </html>"""
+
+
+def _capture_notes(t: dict) -> list:
+    """Human-facing flags about gaps in what was captured. Auto-detects the
+    unambiguous cases (no slides / no transcript); an operator can add others
+    (e.g. 'Partial slides captured') via a 'capture_note' string or list in the
+    talk's metadata.json."""
+    notes = []
+    if t["n_slides"] == 0:
+        notes.append("No slides captured")
+    if not (t["meta"].get("n_text_chunks") or 0):
+        notes.append("No transcript captured")
+    extra = t["meta"].get("capture_note")
+    if isinstance(extra, str) and extra.strip():
+        notes.append(extra.strip())
+    elif isinstance(extra, list):
+        notes += [str(x).strip() for x in extra if str(x).strip()]
+    return notes
 
 
 def _render_talk_card(t: dict, all_talks: list) -> str:
@@ -1586,10 +1792,31 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
     folder, fq, summary, thumb = t["folder"], quote(t["folder"]), t["summary"], t["thumb"]
     title = esc(t["title"])
     when = esc(t["meta"].get("saved_at", ""))
-    n_slides = t["meta"].get("n_slides", 0)
-    thumb_html = (f'<a class="thumb" href="/talks/{fq}/slides/{quote(thumb)}">'
-                  f'<img src="/talks/{fq}/slides/{quote(thumb)}" loading="lazy"></a>'
-                  if thumb else "")
+    n_slides = t["n_slides"]
+    notes = _capture_notes(t)
+    # Main example = first (title) slide; the lightbox pages through every slide.
+    # URLs are absolute (/talks/…) for the live server; export_static rewrites
+    # them to relative paths. The full list rides on a data attribute so the
+    # shared lightbox JS can open it; href falls back to the image if JS is off.
+    slide_urls = [f"/talks/{fq}/slides/{quote(name)}" for name in t["slides"]]
+    if thumb:
+        count_badge = (f'<span class="thumb-count">{n_slides} slides</span>'
+                       if n_slides > 1 else "")
+        thumb_html = (
+            f'<a class="thumb" href="/talks/{fq}/slides/{quote(thumb)}" '
+            f'data-slides=\'{json.dumps(slide_urls)}\' data-title="{title}">'
+            f'<img src="/talks/{fq}/slides/{quote(thumb)}" loading="lazy">'
+            f'{count_badge}</a>')
+    elif n_slides == 0:
+        thumb_html = '<div class="thumb-none"><span>No slides captured</span></div>'
+    else:
+        thumb_html = ""
+    # Capture-gap badges (everything except the no-slides note, which the
+    # thumbnail placeholder already conveys).
+    badge_notes = [n for n in notes if n != "No slides captured"]
+    notes_html = ('<div class="cap-notes">'
+                  + "".join(f'<span class="cap-note">{esc(n)}</span>' for n in badge_notes)
+                  + '</div>') if badge_notes else ""
     if summary and summary.get("status") == "failed":
         inner = '<p class="pending">Summary unavailable.</p>'
     elif summary:
@@ -1613,10 +1840,11 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
         inner = '<p class="pending">Summary generating…</p>'
     related_html = _render_related_html(_related_talks(t, all_talks))
     questions_html = _render_questions_html(folder, t["questions"], t["votes"])
+    links_html = f'<div class="links">{n_slides} slides</div>' if n_slides else ""
     return (f'<article class="card" id="{esc(folder)}">{thumb_html}<div class="card-body">'
-            f'<h2>{title}</h2><div class="when">{when}</div>{inner}'
+            f'<h2>{title}</h2><div class="when">{when}</div>{notes_html}{inner}'
             f'{related_html}{questions_html}'
-            f'<div class="links">{n_slides} slides</div></div></article>')
+            f'{links_html}</div></article>')
 
 
 def _render_day_overview(day_summary, n_talks: int, on_index: bool) -> str:
@@ -1634,21 +1862,41 @@ def _render_day_overview(day_summary, n_talks: int, on_index: bool) -> str:
     return out
 
 
+def _render_day_nav(grouped: list, idx: int) -> str:
+    """Previous/next day links for the foot of a day page. `grouped` is oldest-
+    first, so the previous day is the earlier one and the next day the later."""
+    esc = html.escape
+    prev_html = next_html = ""
+    if idx > 0:
+        pdt, plabel, _ = grouped[idx - 1]
+        prev_html = (f'<a class="prev" href="/summaries/{quote(pdt)}">'
+                     f'<span class="dn-dir">← Previous</span>'
+                     f'<span class="dn-day">{esc(plabel)}</span></a>')
+    if idx < len(grouped) - 1:
+        ndt, nlabel, _ = grouped[idx + 1]
+        next_html = (f'<a class="next" href="/summaries/{quote(ndt)}">'
+                     f'<span class="dn-dir">Next →</span>'
+                     f'<span class="dn-day">{esc(nlabel)}</span></a>')
+    if not (prev_html or next_html):
+        return ""
+    return f'<nav class="day-nav">{prev_html}{next_html}</nav>'
+
+
 def render_day_page(date: str) -> str:
     talks = _load_talks()
     grouped = _group_by_day(talks)
-    match = next(((dt, label, dtalks) for dt, label, dtalks in grouped if dt == date), None)
+    idx = next((i for i, (dt, _l, _t) in enumerate(grouped) if dt == date), None)
     nav = '<a href="/summaries">← all days</a><a href="/topics">key topics</a><a href="/">live</a>'
-    if match is None:
+    if idx is None:
         return _page_shell(f"{CONF_SHORT} — Day not found", CONF_SHORT, nav,
                            '<p class="empty">No talks recorded for this day.</p>')
-    _, day_label, day_talks = match
+    _, day_label, day_talks = grouped[idx]
     day_summary = _ensure_day_summary(date, day_label, day_talks)
     heading = f"{day_label} <span style='color:#555;font-weight:400;font-size:0.7em'>{html.escape(_format_day_date(date))}</span>"
     overview = _render_day_overview(day_summary, len(day_talks), on_index=False)
     # Cards in talk order for the day (oldest first → as the day unfolded).
     cards = "\n".join(_render_talk_card(t, talks) for t in day_talks)
-    body = f'<div class="day-page-head">{overview}</div>{cards}'
+    body = f'<div class="day-page-head">{overview}</div>{cards}{_render_day_nav(grouped, idx)}'
     return _page_shell(f"{CONF_SHORT} — {day_label}", heading, nav, body)
 
 

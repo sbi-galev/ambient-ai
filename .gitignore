@@ -19,6 +19,11 @@ public_talks.txt
 # Local-only list of talks awaiting permission (keeps unauthorised names out of git)
 public_talks.pending.txt
 
+# Generated slide-cleanup plans (local record of what was applied; reproducible)
+/auto_cull.json
+/approved_slides.json
+/slides_clean.json
+
 # LaTeX build intermediates (from whitepaper.py / ambient_ai_whitepaper.py --pdf)
 *.aux
 *.fls

@@ -64,11 +64,14 @@ SITE_DESCRIPTION = _site("SITE_DESCRIPTION", "description",
                          f"A research conference on {CONF_FULL.lower()}.")
 SITE_TOOL_BLURB  = _site(
     "SITE_TOOL_BLURB", "tool_blurb",
-    f"This archive was produced by an ambient-AI assistant ({ASSISTANT_NAME}) that "
+    f"This archive was produced by an on-device ambient-AI assistant that "
     f"listened to each talk and captured its slides in the room. Running entirely "
     f"on local hardware — on-device speech recognition and a self-hosted multimodal "
     f"language model, with no audio or transcript leaving the venue — it wrote the "
     f"per-talk summaries, day overviews and cross-talk topic map collected here.")
+SITE_REPO_URL    = _site("SITE_REPO_URL", "repo_url",
+                         "https://github.com/sbi-galev/ambient-ai")
+SITE_CONFERENCE_URL = _site("SITE_CONFERENCE_URL", "conference_url", "")
 
 # ── Server ────────────────────────────────────────────────────────────────────
 HOST       = _s("TRANSCRIPT_HOST", "server", "host", "0.0.0.0")

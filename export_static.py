@@ -21,7 +21,7 @@ https://<owner>.github.io/<repo>/):
       summaries.html        (= /summaries, the day-by-day archive)
       topics.html           (= /topics)
       day-YYYY-MM-DD.html   (= /summaries/<date>, one per day)
-      talks/<folder>/slides/slide_001.jpg   (referenced thumbnails only)
+      talks/<folder>/slides/slide_*.jpg     (every slide — drives the lightbox)
       .nojekyll
 
 Usage:
@@ -43,7 +43,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import config
 import transcript_server as ts
@@ -51,6 +51,16 @@ import transcript_server as ts
 
 def _warn(msg):
     print(f"  ! {msg}", file=sys.stderr, flush=True)
+
+
+def _load_index(name):
+    """Load a cached index JSON (concepts.json / tools.json) from the talk store,
+    or None if absent/unreadable."""
+    p = ts.SAVE_DIR / name
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
 
 
 # ── Permissions allowlist (fail-closed) ──────────────────────────────────────
@@ -184,8 +194,9 @@ def staticize(s: str) -> str:
     s = s.replace('href="/summaries"', 'href="summaries.html"')
     # 3. Topics page.
     s = s.replace('href="/topics"', 'href="topics.html"')
-    # 4. Slide assets (both src= and href=) → relative.
-    s = s.replace('="/talks/', '="talks/')
+    # 4. Slide assets → relative: src=, href= AND the lightbox data-slides JSON
+    #    (["/talks/…", …]). Matching the leading quote covers all three.
+    s = s.replace('"/talks/', '"talks/')
     # 5. Drop the live-viewer nav link (not part of the static archive).
     s = re.sub(r'<a href="/">[^<]*</a>', '', s)
     # 6. Voting → read-only: strip the vote buttons and remove the voting JS.
@@ -199,15 +210,26 @@ def staticize(s: str) -> str:
 LANDING_CSS = """
     .hero { padding:8px 0 4px; }
     .hero h2 { font-size:1.9em; font-weight:700; color:#fff; line-height:1.2;
-        letter-spacing:0.3px; margin-bottom:0.35em; }
+        letter-spacing:0.3px; margin-bottom:0.15em; }
+    .hero .hero-kicker { color:#9ec9b0; font-size:1.2em; font-weight:600;
+        letter-spacing:0.4px; margin-bottom:0.6em; }
     .hero .hero-meta { color:#6a8; font-size:0.8em; letter-spacing:1px;
         text-transform:uppercase; margin-bottom:1.1em; }
-    .hero .hero-desc { color:#cfcfcf; line-height:1.75; font-size:1.05em;
-        max-width:62ch; }
+    .hero .hero-lead { color:#e6e6e6; line-height:1.7; font-size:1.12em;
+        margin-bottom:0.9em; }
+    .hero .hero-lead b { color:#fff; }
+    .hero .hero-desc { color:#bdbdbd; line-height:1.7; font-size:0.98em; }
+    .hero .conf-link { margin-top:1.1em; }
+    .hero .conf-link a { color:#9ec9b0; font-size:1.0em; text-decoration:none;
+        border:1px solid #3a5a48; border-radius:8px; padding:8px 16px; display:inline-block; }
+    .hero .conf-link a:hover { background:#101410; color:#fff; }
     .about { margin:2.4em 0 0.6em; padding-top:1.8em; border-top:1px solid #1a1a1a; }
     .about h3 { font-size:0.78em; font-weight:600; color:#777; letter-spacing:1.5px;
         text-transform:uppercase; margin-bottom:0.7em; }
-    .about p { color:#bbb; line-height:1.75; max-width:62ch; }
+    .about p { color:#bbb; line-height:1.75; }
+    .repo-link { margin-top:1em; font-size:0.92em; }
+    .repo-link a { color:#9ec9b0; text-decoration:none; }
+    .repo-link a:hover { color:#fff; text-decoration:underline; }
     .landing-cards { display:grid; grid-template-columns:1fr 1fr; gap:16px;
         margin:2.4em 0 1.2em; }
     @media (max-width:560px) { .landing-cards { grid-template-columns:1fr; } }
@@ -223,11 +245,11 @@ LANDING_CSS = """
 """
 
 
-def render_landing(talks, grouped) -> str:
+def render_landing(talks, grouped, have_ct=False) -> str:
     """Build the static archive's front door: conference title + description,
     a note on the ambient-AI tool that produced it, and cards linking to the
-    day summaries and key-topics pages. Static-only (the live server opens
-    straight onto /summaries), so it's assembled here rather than in the server."""
+    day summaries, key-topics (and concepts/tools) pages. Static-only (the live
+    server opens straight onto /summaries), so it's assembled here."""
     esc = html.escape
     n_talks, n_days = len(talks), len(grouped)
     if grouped:
@@ -238,15 +260,37 @@ def render_landing(talks, grouped) -> str:
     else:
         meta = config.CONF_YEAR
 
+    conf_url = config.SITE_CONFERENCE_URL
+    conf_link = (f'<p class="conf-link"><a href="{esc(conf_url)}">Main conference website ↗</a></p>'
+                 if conf_url else "")
+
+    ct_cards = ("""
+      <a class="lcard" href="methods.html">
+        <span class="lcard-h">Methods →</span>
+        <span class="lcard-d">Methods and terms (NPE, NLE, evidence…) with mention counts and the talks that covered them.</span>
+      </a>
+      <a class="lcard" href="tools.html">
+        <span class="lcard-h">Tools &amp; software →</span>
+        <span class="lcard-d">Codes, packages and simulation suites used across the meeting, with links and the talks that used them.</span>
+      </a>""" if have_ct else "")
+
     body = f"""<style>{LANDING_CSS}</style>
     <section class="hero">
       <h2>{esc(config.CONF_FULL)}</h2>
+      <div class="hero-kicker">Ambient AI summary</div>
       <div class="hero-meta">{esc(meta)}</div>
+      <p class="hero-lead">The official <b>ambient-AI summary</b> of the meeting —
+        talk summaries, slides and key topics captured live in the room and written
+        up automatically. For the full programme, schedule and details, head to the
+        main conference website.</p>
       <p class="hero-desc">{esc(config.SITE_DESCRIPTION)}</p>
+      {conf_link}
     </section>
     <section class="about">
       <h3>About this archive</h3>
       <p>{esc(config.SITE_TOOL_BLURB)}</p>
+      <p class="repo-link">The toolkit is open source:
+        <a href="{esc(config.SITE_REPO_URL)}">{esc(config.SITE_REPO_URL.replace("https://", ""))}</a></p>
     </section>
     <nav class="landing-cards">
       <a class="lcard" href="summaries.html">
@@ -256,19 +300,86 @@ def render_landing(talks, grouped) -> str:
       <a class="lcard" href="topics.html">
         <span class="lcard-h">Key topics →</span>
         <span class="lcard-d">The themes that ran across the meeting, linked together as a topic map.</span>
-      </a>
+      </a>{ct_cards}
     </nav>
-    <p class="byline">Summaries written by {esc(config.ASSISTANT_NAME)}, a local AI assistant.</p>"""
+    <p class="byline">Summaries written automatically by a local, on-device AI assistant.</p>"""
 
     nav = '<a href="summaries.html">day summaries</a><a href="topics.html">key topics</a>'
+    if have_ct:
+        nav += '<a href="methods.html">methods</a><a href="tools.html">tools</a>'
+    if conf_url:
+        nav += f'<a href="{esc(conf_url)}">conference ↗</a>'
     heading = f"{esc(config.CONF_SHORT)} {esc(config.CONF_YEAR)}"
-    return ts._page_shell(f"{config.CONF_SHORT} {config.CONF_YEAR}", heading, nav, body)
+    return ts._page_shell(f"{config.CONF_SHORT} {config.CONF_YEAR} — Ambient AI summary",
+                          heading, nav, body)
 
 
-def add_home(htmlstr: str) -> str:
-    """Give every non-landing page a link back to the landing page."""
-    return htmlstr.replace('<div class="navlinks">',
-                           '<div class="navlinks"><a href="index.html">home</a>', 1)
+def add_nav(htmlstr: str, frag: str) -> str:
+    """Prepend extra nav links (home, and concepts/tools when present) to a
+    server-rendered page's nav bar."""
+    return htmlstr.replace('<div class="navlinks">', f'<div class="navlinks">{frag}', 1)
+
+
+CONCEPTS_CSS = """
+    .lede { color:#9a9a9a; line-height:1.6; margin:0 0 1.4em; max-width:66ch; }
+    .ci { padding:20px 0; border-top:1px solid #1a1a1a; }
+    .ci h2 { font-size:1.15em; color:#fff; font-weight:600; display:flex;
+        align-items:baseline; gap:10px; flex-wrap:wrap; }
+    .ci h2 .abbr { color:#9ec9b0; font-size:0.7em; letter-spacing:1px; }
+    .ci h2 a { color:#9ec9b0; text-decoration:none; }
+    .ci h2 a:hover { color:#fff; }
+    .ci-meta { color:#777; font-size:0.78em; letter-spacing:0.5px; margin:0.35em 0 0.55em; }
+    .ci-meta b { color:#9ec9b0; font-weight:600; }
+    .ci-def { color:#cccccc; line-height:1.65; margin-bottom:0.6em; max-width:72ch; }
+    .ci-talks { font-size:0.88em; color:#777; line-height:1.9; }
+    .ci-talks a { color:#cdd; text-decoration:none; }
+    .ci-talks a:hover { color:#fff; }
+"""
+
+
+def _concept_talks_html(talks):
+    esc = html.escape
+    return " · ".join(
+        f'<a href="/summaries/{quote(t["date"])}#{esc(t["folder"])}">{esc(t["title"])}</a>'
+        for t in talks)
+
+
+def render_concepts(data, nav):
+    esc = html.escape
+    rows = []
+    for c in data["concepts"]:
+        abbr = (f'<span class="abbr">{esc(c["abbr"])}</span>'
+                if c.get("abbr") and c["abbr"] != c["name"] else "")
+        rows.append(
+            f'<section class="ci"><h2>{esc(c["name"])} {abbr}</h2>'
+            f'<div class="ci-meta"><b>{c["transcript_mentions"]}</b> transcript · '
+            f'<b>{c["slide_mentions"]}</b> slide mentions · {len(c["talks"])} talk(s)</div>'
+            f'<p class="ci-def">{esc(c.get("definition",""))}</p>'
+            f'<div class="ci-talks">{_concept_talks_html(c["talks"])}</div></section>')
+    lede = (f'The methods and techniques used across {esc(config.CONF_SHORT)}, with how '
+            'often each was mentioned in talk transcripts and slides, and the talks that '
+            'covered it. Extracted and counted on-box.')
+    body = f'<style>{CONCEPTS_CSS}</style><p class="lede">{lede}</p>{"".join(rows)}'
+    return ts._page_shell(f"{config.CONF_SHORT} — Methods", "Methods", nav, body)
+
+
+def render_tools(data, nav):
+    esc = html.escape
+    rows = []
+    for t in data["tools"]:
+        url = t.get("url", "")
+        name = (f'<a href="{esc(url)}">{esc(t["name"])} ↗</a>' if url else esc(t["name"]))
+        rows.append(
+            f'<section class="ci"><h2>{name}</h2>'
+            f'<div class="ci-meta"><b>{t["transcript_mentions"]}</b> transcript · '
+            f'<b>{t["slide_mentions"]}</b> slide mentions · {len(t["talks"])} talk(s)</div>'
+            f'<p class="ci-def">{esc(t.get("description",""))}</p>'
+            f'<div class="ci-talks">{_concept_talks_html(t["talks"])}</div></section>')
+    lede = (f'Software, codes, frameworks and simulation suites used across '
+            f'{esc(config.CONF_SHORT)}. Links point to each project\'s page where known '
+            '(looked up on-box). Counts are mentions across talk transcripts and slides.')
+    body = f'<style>{CONCEPTS_CSS}</style><p class="lede">{lede}</p>{"".join(rows)}'
+    return ts._page_shell(f"{config.CONF_SHORT} — Tools", "Tools &amp; software", nav, body)
 
 
 # ── Assets ─────────────────────────────────────────────────────────────────────
@@ -313,7 +424,7 @@ def copy_assets(refs, talks, out: Path, all_slides, include_transcripts, verbose
 
 # ── Verification ───────────────────────────────────────────────────────────────
 
-_FORBIDDEN = ['="/summaries', '="/topics"', '="/talks/', 'href="/"',
+_FORBIDDEN = ['="/summaries', '="/topics"', '"/talks/', 'href="/"',
               'function vote(', '/vote', '/topics.json', '/stream',
               'EventSource', 'class="qvote"', 'class="generating"', 'id="gen-timer"']
 
@@ -346,7 +457,7 @@ def main():
                     help="skip the LLM (topics use the keyword fallback; stale day "
                          "overviews render as placeholders)")
     ap.add_argument("--all-slides", action="store_true",
-                    help="copy every slide of every talk, not just referenced thumbnails")
+                    help="(deprecated; now always on) every slide is copied for the lightbox")
     ap.add_argument("--include-transcripts", action="store_true",
                     help="also publish full transcripts (PUBLIC, no access control)")
     ap.add_argument("--strict", action="store_true",
@@ -374,25 +485,43 @@ def main():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Concepts/Tools indexes (built on-box by concepts_tools.py); pages appear
+    # only when both are present and non-empty.
+    concepts = _load_index("concepts.json")
+    tools = _load_index("tools.json")
+    have_ct = bool(concepts and concepts.get("concepts")) and bool(tools and tools.get("tools"))
+    nav_frag = '<a href="index.html">home</a>'
+    if have_ct:
+        nav_frag += '<a href="methods.html">methods</a><a href="tools.html">tools</a>'
+
     # Render every page through the static post-processor. index.html is the new
     # landing page; the day-by-day archive (formerly index.html) is summaries.html.
     grouped = ts._group_by_day(talks)
     pages = {
-        "index.html": staticize(render_landing(talks, grouped)),
-        "summaries.html": add_home(staticize(ts.render_summaries_page())),
-        "topics.html": add_home(staticize(ts.render_topics_page())),
+        "index.html": staticize(render_landing(talks, grouped, have_ct)),
+        "summaries.html": add_nav(staticize(ts.render_summaries_page()), nav_frag),
+        "topics.html": add_nav(staticize(ts.render_topics_page()), nav_frag),
     }
     for date, _label, _dtalks in grouped:
-        pages[f"day-{date}.html"] = add_home(staticize(ts.render_day_page(date)))
+        pages[f"day-{date}.html"] = add_nav(staticize(ts.render_day_page(date)), nav_frag)
+    if have_ct:
+        ct_nav = ('<a href="summaries.html">day summaries</a>'
+                  '<a href="topics.html">key topics</a>')
+        pages["methods.html"] = add_nav(staticize(render_concepts(concepts, ct_nav)), nav_frag)
+        pages["tools.html"] = add_nav(staticize(render_tools(tools, ct_nav)), nav_frag)
     for name, body in pages.items():
         (out / name).write_text(body)
         if args.verbose:
             print(f"  wrote {name} ({len(body)} bytes)", flush=True)
 
-    # Copy only the slide thumbnails the pages reference.
+    # Copy EVERY slide of every published talk — the lightbox pages through them
+    # all (the card thumbnail is just slide 1). Culled slides live in slides/.culled/
+    # and are never globbed, so they're excluded automatically. `refs` (the slide-1
+    # thumbnails parsed from the HTML) is still used by verify() as a sanity subset.
     combined = "\n".join(pages.values())
     refs = sorted(set(re.findall(r'(?:src|href)="(talks/[^"]+)"', combined)))
-    copy_assets(refs, talks, out, args.all_slides, args.include_transcripts, args.verbose)
+    copy_assets(refs, talks, out, all_slides=True,
+                include_transcripts=args.include_transcripts, verbose=args.verbose)
 
     (out / ".nojekyll").write_text("")
 

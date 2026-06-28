@@ -28,6 +28,10 @@ assistant_name = "alan"                                       # env: ASSISTANT_N
 tagline     = "A research meeting on simulation-based inference for galaxy evolution."  # env: SITE_TAGLINE
 description  = "SBI4GALEV brought together astronomers, cosmologists and machine-learning researchers working on simulation-based inference — using forward models of the Universe to constrain how galaxies form and evolve. This public archive collects AI-written summaries of the talks given at the meeting."  # env: SITE_DESCRIPTION
 tool_blurb   = ""  # blank → built-in default (see config.py)                # env: SITE_TOOL_BLURB
+# Link shown on the landing page to the open-source toolkit behind the archive.
+repo_url    = "https://github.com/sbi-galev/ambient-ai"                       # env: SITE_REPO_URL
+# The conference's own website, linked prominently from the archive landing page.
+conference_url = "https://sbi-galev.github.io/2026/"                          # env: SITE_CONFERENCE_URL
 
 [server]
 host = "0.0.0.0"          # interface to bind; 0.0.0.0 = all (LAN).   env: TRANSCRIPT_HOST
