@@ -1441,6 +1441,12 @@ def _load_talks() -> list:
                 summary = json.loads((d / "summary.json").read_text())
             except Exception:
                 summary = None
+        # Merge in the conference-schedule abstract from the sidecar if the stored
+        # summary predates it (it's only injected at generation time otherwise).
+        if summary and not summary.get("official_abstract"):
+            official = _load_official_abstract(d)
+            if official:
+                summary["official_abstract"] = official["abstract"]
         questions = []
         if (d / "questions.json").exists():
             try:
@@ -1592,6 +1598,7 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
             speaker += f" — {esc(summary['affiliation'])}"
         sp = f'<div class="speaker">{speaker}</div>' if speaker else ""
         abstract = esc(summary.get("abstract") or "")
+        abstract_html = f"<p class='abstract'>{abstract}</p>" if abstract else ""
         official = esc(summary.get("official_abstract") or "")
         official_html = (f"<details class='official-abstract'><summary>Abstract "
                          f"(conference schedule)</summary><p>{official}</p></details>"
@@ -1601,7 +1608,7 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
         tps = summary.get("topics", [])
         tps_html = ("<div class='topics'>" +
                     "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
-        inner = f"{sp}{pts_html}{tps_html}<p class='abstract'>{abstract}</p>{official_html}"
+        inner = f"{sp}{abstract_html}{pts_html}{tps_html}{official_html}"
     else:
         inner = '<p class="pending">Summary generating…</p>'
     related_html = _render_related_html(_related_talks(t, all_talks))
