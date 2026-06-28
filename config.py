@@ -52,6 +52,24 @@ CONF_FULL      = _s("CONF_FULL", "conference", "full_name",
 CONF_YEAR      = _s("CONF_YEAR", "conference", "year", "2026")
 ASSISTANT_NAME = _s("ASSISTANT_NAME", "conference", "assistant_name", "alan")
 
+# ── Public archive landing page (export_static.py) ────────────────────────────
+# A blank value (in config.toml or the env) falls back to the default here.
+def _site(env, key, default):
+    v = _s(env, "site", key, "").strip()
+    return v if v else default
+
+SITE_TAGLINE     = _site("SITE_TAGLINE", "tagline",
+                         f"{CONF_FULL} — {CONF_YEAR}")
+SITE_DESCRIPTION = _site("SITE_DESCRIPTION", "description",
+                         f"A research conference on {CONF_FULL.lower()}.")
+SITE_TOOL_BLURB  = _site(
+    "SITE_TOOL_BLURB", "tool_blurb",
+    f"This archive was produced by an ambient-AI assistant ({ASSISTANT_NAME}) that "
+    f"listened to each talk and captured its slides in the room. Running entirely "
+    f"on local hardware — on-device speech recognition and a self-hosted multimodal "
+    f"language model, with no audio or transcript leaving the venue — it wrote the "
+    f"per-talk summaries, day overviews and cross-talk topic map collected here.")
+
 # ── Server ────────────────────────────────────────────────────────────────────
 HOST       = _s("TRANSCRIPT_HOST", "server", "host", "0.0.0.0")
 PORT       = _i("TRANSCRIPT_PORT", "server", "port", 7103)

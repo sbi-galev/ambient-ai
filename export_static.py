@@ -17,7 +17,8 @@ modified — the static-specific transforms are post-processing here.
 Output layout (flat, relative links → works under any base path, incl.
 https://<owner>.github.io/<repo>/):
     site/
-      index.html            (= /summaries, the archive home)
+      index.html            (landing page: conference + tool intro, links below)
+      summaries.html        (= /summaries, the day-by-day archive)
       topics.html           (= /topics)
       day-YYYY-MM-DD.html   (= /summaries/<date>, one per day)
       talks/<folder>/slides/slide_001.jpg   (referenced thumbnails only)
@@ -36,6 +37,7 @@ One-time: repo Settings -> Pages -> Source: Deploy from a branch -> gh-pages /
 ever holds the latest site; GitHub rebuilds Pages on each push (no workflow).
 """
 import argparse
+import html
 import json
 import re
 import shutil
@@ -43,6 +45,7 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote
 
+import config
 import transcript_server as ts
 
 
@@ -177,8 +180,8 @@ def staticize(s: str) -> str:
     s = re.sub(r'href="/summaries/(\d{4}-\d{2}-\d{2})(#[^"]*)?"',
                lambda m: f'href="day-{m.group(1)}.html{m.group(2) or ""}"', s)
     # 2. Summaries index (anchor fallback first, then bare).
-    s = s.replace('href="/summaries#', 'href="index.html#')
-    s = s.replace('href="/summaries"', 'href="index.html"')
+    s = s.replace('href="/summaries#', 'href="summaries.html#')
+    s = s.replace('href="/summaries"', 'href="summaries.html"')
     # 3. Topics page.
     s = s.replace('href="/topics"', 'href="topics.html"')
     # 4. Slide assets (both src= and href=) → relative.
@@ -189,6 +192,83 @@ def staticize(s: str) -> str:
     s = re.sub(r'<span class="qvote">.*?</span>', '', s, flags=re.S)
     s = s.replace(ts.SUMMARIES_JS, "")
     return s
+
+
+# ── Landing page (static archive only — the live server has no front door) ─────
+
+LANDING_CSS = """
+    .hero { padding:8px 0 4px; }
+    .hero h2 { font-size:1.9em; font-weight:700; color:#fff; line-height:1.2;
+        letter-spacing:0.3px; margin-bottom:0.35em; }
+    .hero .hero-meta { color:#6a8; font-size:0.8em; letter-spacing:1px;
+        text-transform:uppercase; margin-bottom:1.1em; }
+    .hero .hero-desc { color:#cfcfcf; line-height:1.75; font-size:1.05em;
+        max-width:62ch; }
+    .about { margin:2.4em 0 0.6em; padding-top:1.8em; border-top:1px solid #1a1a1a; }
+    .about h3 { font-size:0.78em; font-weight:600; color:#777; letter-spacing:1.5px;
+        text-transform:uppercase; margin-bottom:0.7em; }
+    .about p { color:#bbb; line-height:1.75; max-width:62ch; }
+    .landing-cards { display:grid; grid-template-columns:1fr 1fr; gap:16px;
+        margin:2.4em 0 1.2em; }
+    @media (max-width:560px) { .landing-cards { grid-template-columns:1fr; } }
+    .lcard { display:block; padding:22px 22px 24px; border:1px solid #1f1f1f;
+        border-radius:10px; background:#0e0e0e; text-decoration:none;
+        transition:border-color 0.15s, background 0.15s; }
+    .lcard:hover { border-color:#3a5a48; background:#101410; }
+    .lcard .lcard-h { display:block; color:#fff; font-size:1.12em; font-weight:600;
+        margin-bottom:0.4em; }
+    .lcard:hover .lcard-h { color:#9ec9b0; }
+    .lcard .lcard-d { display:block; color:#999; font-size:0.88em; line-height:1.6; }
+    .byline { color:#555; font-size:0.78em; margin-top:1.8em; }
+"""
+
+
+def render_landing(talks, grouped) -> str:
+    """Build the static archive's front door: conference title + description,
+    a note on the ambient-AI tool that produced it, and cards linking to the
+    day summaries and key-topics pages. Static-only (the live server opens
+    straight onto /summaries), so it's assembled here rather than in the server."""
+    esc = html.escape
+    n_talks, n_days = len(talks), len(grouped)
+    if grouped:
+        first, last = grouped[0][0], grouped[-1][0]
+        when = (ts._format_day_date(first) if first == last
+                else f"{ts._format_day_date(first)} – {ts._format_day_date(last)}")
+        meta = f"{when} · {n_talks} talk{'s' if n_talks != 1 else ''} over {n_days} day{'s' if n_days != 1 else ''}"
+    else:
+        meta = config.CONF_YEAR
+
+    body = f"""<style>{LANDING_CSS}</style>
+    <section class="hero">
+      <h2>{esc(config.CONF_FULL)}</h2>
+      <div class="hero-meta">{esc(meta)}</div>
+      <p class="hero-desc">{esc(config.SITE_DESCRIPTION)}</p>
+    </section>
+    <section class="about">
+      <h3>About this archive</h3>
+      <p>{esc(config.SITE_TOOL_BLURB)}</p>
+    </section>
+    <nav class="landing-cards">
+      <a class="lcard" href="summaries.html">
+        <span class="lcard-h">Day summaries →</span>
+        <span class="lcard-d">An editorial overview of each day, talk by talk, with slides and key points.</span>
+      </a>
+      <a class="lcard" href="topics.html">
+        <span class="lcard-h">Key topics →</span>
+        <span class="lcard-d">The themes that ran across the meeting, linked together as a topic map.</span>
+      </a>
+    </nav>
+    <p class="byline">Summaries written by {esc(config.ASSISTANT_NAME)}, a local AI assistant.</p>"""
+
+    nav = '<a href="summaries.html">day summaries</a><a href="topics.html">key topics</a>'
+    heading = f"{esc(config.CONF_SHORT)} {esc(config.CONF_YEAR)}"
+    return ts._page_shell(f"{config.CONF_SHORT} {config.CONF_YEAR}", heading, nav, body)
+
+
+def add_home(htmlstr: str) -> str:
+    """Give every non-landing page a link back to the landing page."""
+    return htmlstr.replace('<div class="navlinks">',
+                           '<div class="navlinks"><a href="index.html">home</a>', 1)
 
 
 # ── Assets ─────────────────────────────────────────────────────────────────────
@@ -294,11 +374,16 @@ def main():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Render every page through the static post-processor.
-    pages = {"index.html": staticize(ts.render_summaries_page()),
-             "topics.html": staticize(ts.render_topics_page())}
-    for date, _label, _dtalks in ts._group_by_day(talks):
-        pages[f"day-{date}.html"] = staticize(ts.render_day_page(date))
+    # Render every page through the static post-processor. index.html is the new
+    # landing page; the day-by-day archive (formerly index.html) is summaries.html.
+    grouped = ts._group_by_day(talks)
+    pages = {
+        "index.html": staticize(render_landing(talks, grouped)),
+        "summaries.html": add_home(staticize(ts.render_summaries_page())),
+        "topics.html": add_home(staticize(ts.render_topics_page())),
+    }
+    for date, _label, _dtalks in grouped:
+        pages[f"day-{date}.html"] = add_home(staticize(ts.render_day_page(date)))
     for name, body in pages.items():
         (out / name).write_text(body)
         if args.verbose:
