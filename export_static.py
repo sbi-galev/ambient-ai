@@ -27,11 +27,13 @@ Usage:
     python3 export_static.py [--out DIR] [--clean] [--no-llm]
                             [--all-slides] [--include-transcripts] [--strict] [-v]
 
-Deploy (GitHub Actions auto-publishes the committed site/ on push):
-    python3 export_static.py --clean
-    git add site && git commit -m "Update static archive" && git push
-One-time: repo Settings -> Pages -> Source: GitHub Actions. Deploys use the
-workflow's GITHUB_TOKEN, so no personal credentials are needed for deploys.
+Deploy: the built site/ is git-ignored and lives on its own `gh-pages` branch,
+which GitHub Pages serves directly. The publish_site.sh helper builds and pushes
+it in one step:
+    ./publish_site.sh        # = export_static.py --clean, then push site/ -> gh-pages
+One-time: repo Settings -> Pages -> Source: Deploy from a branch -> gh-pages /
+(root). publish_site.sh force-pushes a single fresh commit, so the branch only
+ever holds the latest site; GitHub rebuilds Pages on each push (no workflow).
 """
 import argparse
 import json

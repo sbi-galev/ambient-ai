@@ -263,23 +263,31 @@ day or topic caches).
 
 ### Permissions allowlist (fail-closed)
 
-Publishing is **opt-in per speaker**. [`public_talks.txt`](public_talks.txt)
-lists the approved talks, one folder name (or readable slug) per line; anything
-not listed is excluded, and a missing/empty file exports nothing. To add a
-speaker once they grant permission, uncomment/add their line and re-export.
+Publishing is **opt-in per speaker**, controlled by a `public_talks.txt`
+allowlist: one approved talk per line (folder name or readable slug), anything
+not listed is excluded, and a missing/empty file exports nothing. This file is
+**git-ignored** — it names real speakers, so it stays out of the template. Copy
+the tracked [`public_talks.example.txt`](public_talks.example.txt) to
+`public_talks.txt` and fill in your event's approved talks; add a speaker once
+they grant permission, then re-export.
 
 ### Build & deploy
 
+The built `site/` is **not** committed to the main branch (it's git-ignored). It
+lives on its own `gh-pages` branch, which GitHub Pages serves directly. The
+[`publish_site.sh`](publish_site.sh) helper builds the archive and pushes it
+there in one step:
+
 ```bash
-python3 export_static.py --clean
-git add site && git commit -m "Update static archive" && git push
+./publish_site.sh            # = export_static.py --clean, then push site/ to gh-pages
 ```
 
-A GitHub Actions workflow ([`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml))
-publishes the committed `site/` to GitHub Pages on every push that touches it
-(it serves what you commit — it does **not** rebuild). One-time setup: repo
-**Settings → Pages → Source: GitHub Actions**. Deploys use the workflow's
-built-in `GITHUB_TOKEN`, so no personal credentials are needed.
+It force-pushes a single fresh commit to `gh-pages` (the branch only ever holds
+the latest generated site — no history to scrub). One-time setup: repo
+**Settings → Pages → Source: Deploy from a branch → `gh-pages` / (root)**. No
+Actions workflow or personal credentials are involved; GitHub auto-builds Pages
+on each push to the branch. To build without publishing, run
+`python3 export_static.py --clean` and inspect `site/` directly.
 
 Useful flags: `--no-llm` (skip the model; topics use the keyword fallback),
 `--all-slides`, `--strict` (treat missing summaries as errors), `-v`. Serve a
@@ -337,7 +345,7 @@ schema is documented at the top of the script).
 | `live_transcribe.py` | laptop | Mic/system-audio capture + silent slide capture → POST |
 | `screen_capture.py` | laptop | PipeWire/ScreenCast portal capture (used by the above) |
 | `export_static.py` | server | Render the archive to a static `site/` for Pages |
-| `public_talks.txt` | server | Per-speaker publish allowlist (fail-closed) |
+| `public_talks.example.txt` | server | Template for the per-speaker publish allowlist; copy to `public_talks.txt` (git-ignored, fail-closed) |
 | `backfill_summaries.py` | server | Generate summaries for talks missing one |
 | `backfill_day_summaries.py` | server | Generate/refresh per-day overviews |
 | `backfill_topics.py` | server | Generate/refresh the key-topics synthesis |

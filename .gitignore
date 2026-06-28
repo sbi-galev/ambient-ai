@@ -8,6 +8,14 @@ topic_summaries/
 votes/
 .claude/settings.local.json
 
+# Generated static site — published to the gh-pages branch, never committed on
+# the main branch (build with export_static.py / publish with publish_site.sh).
+site/
+
+# Per-speaker publish allowlist: names real speakers, so it stays out of the
+# template. Copy public_talks.example.txt -> public_talks.txt to create it.
+public_talks.txt
+
 # Local-only list of talks awaiting permission (keeps unauthorised names out of git)
 public_talks.pending.txt
 

@@ -1,0 +1,26 @@
+# Allowlist of talks approved for public export (GitHub Pages) — TEMPLATE.
+#
+# Copy this file to `public_talks.txt` (which is git-ignored, so real speaker
+# names never enter the repository) and edit it for your event:
+#   cp public_talks.example.txt public_talks.txt
+#
+# List one transcript folder name (or readable slug) per line. ONLY talks listed
+# in public_talks.txt are written into site/ by export_static.py; everything else
+# is excluded (fail-closed) — a missing or empty file exports nothing. Blank
+# lines and lines starting with # are ignored.
+#
+# Publishing is opt-in per speaker: add a speaker's slug here only once they have
+# granted permission, then re-publish:  ./publish_site.sh
+#
+# A slug is the talk's folder name with the leading "YYYY-MM-DD_HH-MM-SS_" stamp
+# removed, e.g. folder 2026-06-23_09-43-59_ada-lovelace -> slug "ada-lovelace".
+# You may also paste the full folder name.
+
+# ── Permission granted (speaker talks) ──────────────────────────────────────
+# ada-lovelace
+# grace-hopper
+# 2026-06-23_09-43-59_opening-keynote
+
+# ── Organiser / group sessions (not individual research talks) ───────────────
+# introduction
+# data-challenge
