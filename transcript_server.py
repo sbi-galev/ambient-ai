@@ -1006,16 +1006,22 @@ def _related_talks(t: dict, talks: list, k: int = 3):
         if cur_title and ow:
             s += 0.3 * len(cur_title & ow) / len(cur_title | ow)
         if s > 0:
-            scored.append((s, o["folder"], o["title"]))
+            scored.append((s, o["folder"], o["title"], _talk_day(o)))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    return [(f, ti) for _, f, ti in scored[:k]]
+    return [(f, ti, dt) for _, f, ti, dt in scored[:k]]
 
 
 def _render_related_html(related) -> str:
     if not related:
         return ""
     esc = html.escape
-    links = " · ".join(f'<a href="#{esc(f)}">{esc(ti)}</a>' for f, ti in related)
+    # Cross-page links: each related talk lives on its own day page. On the live
+    # server this is the /summaries/<date> route; export_static rewrites it to
+    # day-<date>.html#<folder>. A bare #<folder> would only work when the target
+    # happens to be on the same page (it usually is not).
+    links = " · ".join(
+        f'<a href="/summaries/{quote(dt)}#{esc(f)}">{esc(ti)}</a>'
+        for f, ti, dt in related)
     return f'<div class="related">Related talks: {links}</div>'
 
 
@@ -1595,7 +1601,7 @@ def _render_talk_card(t: dict, all_talks: list) -> str:
         tps = summary.get("topics", [])
         tps_html = ("<div class='topics'>" +
                     "".join(f"<span>{esc(x)}</span>" for x in tps) + "</div>") if tps else ""
-        inner = f"{sp}<p class='abstract'>{abstract}</p>{official_html}{pts_html}{tps_html}"
+        inner = f"{sp}{pts_html}{tps_html}<p class='abstract'>{abstract}</p>{official_html}"
     else:
         inner = '<p class="pending">Summary generating…</p>'
     related_html = _render_related_html(_related_talks(t, all_talks))
