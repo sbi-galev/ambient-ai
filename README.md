@@ -335,6 +335,34 @@ yourself, with the originals backed up under `transcripts/.backups/`. Splitting 
 folder that bundles several talks or a break is done with a hand-written plan (the
 schema is documented at the top of the script).
 
+### Slide cleanup
+
+Capture is noisy — setup screens, the next speaker's title shown early, blank
+frames, slides that bleed across hand-overs. All on-box and human-reviewed
+(nothing is auto-deleted):
+
+- **`slide_audit.py`** — describe + triage every slide (content vs junk + a
+  confidence) → `transcripts/slides_audit.json` (descriptions double as captions).
+- **`slide_review.py`** — split that into `auto_cull.json` (high-confidence junk)
+  and a `site/review.html` to approve/adjust the rest and download a plan.
+- **`fix_transcript_cuts.py slides-propose`** — flag boundary slides that belong
+  to the neighbouring talk (timestamp + content) or are junk.
+- **`cull_slides.py`** — propose whole-talk junk culls.
+
+Apply any plan with **`fix_transcript_cuts.py slides-apply <plan>`**: backs up,
+moves/renumbers slides in timestamp order, re-locks, verifies; culled slides go to
+`slides/.culled/` (reversible). Refresh affected talks with
+`backfill_summaries.py --force`.
+
+### Methods & Tools indexes
+
+**`concepts_tools.py build`** has the local model extract the methods/terms and
+the software & simulation suites used across the approved talks, counts mentions
+(transcripts + slide descriptions) and links each to the talks → `methods.html` /
+`tools.html`. Tool URLs are model-proposed then verified by an on-box HTTP fetch
+(dead links dropped). Re-run `concepts_tools.py count` (no model) after editing
+`transcripts/concepts_tools.raw.json`.
+
 
 ## Script reference
 
@@ -349,7 +377,11 @@ schema is documented at the top of the script).
 | `backfill_summaries.py` | server | Generate summaries for talks missing one |
 | `backfill_day_summaries.py` | server | Generate/refresh per-day overviews |
 | `backfill_topics.py` | server | Generate/refresh the key-topics synthesis |
-| `fix_transcript_cuts.py` | server | Re-cut mis-bounded talk folders (local-LLM proposal) |
+| `fix_transcript_cuts.py` | server | Re-cut mis-bounded talks + reassign/cull boundary slides (local-LLM) |
+| `slide_audit.py` | server | Describe + triage every slide (content vs junk) |
+| `cull_slides.py` | server | Propose whole-talk junk-slide culls (local-LLM) |
+| `slide_review.py` | server | Build the auto-cull plan + `review.html` |
+| `concepts_tools.py` | server | Build the Methods & Tools indexes (`methods.html` / `tools.html`) |
 | `whitepaper.py` | server | Conference **summary** white paper (via the LLM agent) |
 | `whitepaper/ambient_ai_whitepaper.py` | server | Methods paper about the system |
 | `test_transducer.py` | server | One-shot STT smoke test / benchmark |
